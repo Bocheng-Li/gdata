@@ -74,8 +74,8 @@ def _read_annotation(genome, key: str, feature: str ='gene', gene_type: str | No
     gtf.index = annotation.from_attributes(key, annot=gtf)
 
     if gene_type is not None:
-        gene_type = annotation.from_attributes('gene_type', annot=gtf)
-        gtf = gtf[gene_type == gene_type]
+        gene_type_series = annotation.from_attributes('gene_type', annot=gtf)
+        gtf = gtf[gene_type_series == gene_type]
 
     return gtf
 
