@@ -38,6 +38,9 @@ fn gdata(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<dataloader::genome::GenomeDataLoader>()?;
     m.add_class::<dataloader::genome::GenomeDataLoaderMap>()?;
     m.add_class::<dataloader::genome::CatGenomeDataLoader>()?;
+    m.add_class::<dataloader::genome::GenomeDataset>()?;
+    m.add_class::<dataloader::genome::GenomeDatasetMap>()?;
+    m.add_class::<dataloader::genome::CatGenomeDataset>()?;
 
     utils::register_utils(m)?;
 

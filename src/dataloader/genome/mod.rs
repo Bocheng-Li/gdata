@@ -1,9 +1,11 @@
 mod builder;
 mod data_store;
 mod loader;
+mod dataset;
 
 pub use builder::GenomeDataBuilder;
 pub use loader::{CatGenomeDataLoader, GenomeDataLoader, GenomeDataLoaderMap};
+pub use dataset::{CatGenomeDataset, GenomeDataset, GenomeDatasetMap};
 
 #[cfg(test)]
 mod tests {
