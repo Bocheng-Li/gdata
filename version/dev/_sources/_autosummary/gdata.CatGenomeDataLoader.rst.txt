@@ -1,0 +1,30 @@
+﻿gdata.CatGenomeDataLoader
+=========================
+
+.. currentmodule:: gdata
+
+.. autoclass:: CatGenomeDataLoader
+
+   
+   
+   .. rubric:: Attributes
+
+   .. autosummary::
+      :toctree: .
+   
+      ~CatGenomeDataLoader.n_tracks
+      ~CatGenomeDataLoader.resolution
+      ~CatGenomeDataLoader.target_length
+      ~CatGenomeDataLoader.window_size
+   
+   
+
+   
+   
+   .. rubric:: Methods
+
+   .. autosummary::
+      :toctree: .
+   
+   
+   
