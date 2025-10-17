@@ -126,6 +126,21 @@ impl std::fmt::Display for GenomeDataLoader {
 }
 
 impl GenomeDataLoader {
+    fn effective_window_size(&self) -> u32 {
+        // Length of returned sequences
+        self.data_store
+            .read_opts
+            .split_size
+            .unwrap_or(self.data_store.sequence_length())
+    }
+
+    fn effective_target_length(&self) -> u32 {
+        // Length of returned values
+        self.data_store
+            .read_opts
+            .value_length
+            .unwrap_or(self.effective_window_size())
+    }
     pub fn num_segments(&self) -> usize {
         self.subset
             .as_ref()
@@ -308,10 +323,7 @@ impl GenomeDataLoader {
     */
     #[getter]
     fn window_size(&self) -> u32 {
-        self.data_store
-            .read_opts
-            .split_size
-            .unwrap_or(self.data_store.sequence_length())
+        self.effective_window_size()
     }
 
     /** The length of the target vector in base pairs.
@@ -323,10 +335,7 @@ impl GenomeDataLoader {
     */
     #[getter]
     fn target_length(&self) -> u32 {
-        self.data_store
-            .read_opts
-            .value_length
-            .unwrap_or(self.window_size())
+        self.effective_target_length()
     }
 
     #[getter]
@@ -614,6 +623,9 @@ impl Iterator for GenomeDataLoaderIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         let (mut seq, val) = self.iter.next()?;
+        // When store_pad == false, values returned by DataStore are already the centered slice.
+        // When store_pad == true, values match the returned sequence window.
+        // If the caller requested target_length < window_size (via DataStore options), it's already trimmed.
         if self.seq_as_string {
             seq.mapv_inplace(|x| decode_nucleotide(x).unwrap());
         }
@@ -803,6 +815,14 @@ impl GenomeDataLoaderMap {
             "All genome data loaders must have the same window size",
         );
 
+        ensure!(
+            loaders
+                .values()
+                .map(|loader| loader.target_length())
+                .all_equal(),
+            "All genome data loaders must have the same target length",
+        );
+
         Ok(Self(loaders.into_iter().map(|(k, v)| (k, v)).collect()))
     }
 
@@ -841,6 +861,21 @@ impl GenomeDataLoaderMap {
     #[getter]
     fn batch_size(&self) -> usize {
         self.0[0].batch_size
+    }
+
+    #[getter]
+    fn window_size(&self) -> u32 {
+        self.0[0].window_size()
+    }
+
+    #[getter]
+    fn target_length(&self) -> u32 {
+        self.0[0].target_length()
+    }
+
+    #[getter]
+    fn resolution(&self) -> u32 {
+        self.0[0].resolution()
     }
 
     /** Creates a new genomic data loader based on specified regions.
@@ -1067,6 +1102,21 @@ impl CatGenomeDataLoader {
                 .iter()
                 .flat_map(|loader| loader.n_tracks().into_iter()),
         )
+    }
+
+    #[getter]
+    fn window_size(&self) -> u32 {
+        self.0[0].window_size()
+    }
+
+    #[getter]
+    fn target_length(&self) -> u32 {
+        self.0[0].target_length()
+    }
+
+    #[getter]
+    fn resolution(&self) -> u32 {
+        self.0[0].resolution()
     }
 
     fn __len__(&self) -> usize {

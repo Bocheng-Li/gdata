@@ -114,6 +114,7 @@ impl GenomeDataBuilder {
             window_size,
             resolution,
             padding,
+            true,
         )?;
         let mut fasta_reader = open_fasta(genome_fasta)?;
 

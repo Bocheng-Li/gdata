@@ -87,6 +87,7 @@ pub struct StoreMetadata {
     sequence_length: u32,
     resolution: u32,
     padding: u32,
+    store_pad: bool,
 }
 
 impl StoreMetadata {
@@ -150,14 +151,19 @@ pub struct DataStore {
 }
 
 impl DataStore {
+    pub fn store_pad(&self) -> bool {
+        self.inner.metadata.store_pad
+    }
     pub fn open(path: impl AsRef<Path>, mut read_opts: DataStoreReadOptions) -> Result<Self> {
         let mut file = File::open(&path).context("Failed to open data store file")?;
         let metadata = read_metadata(&mut file)?;
 
-        ensure!(
-            read_opts.shift_width <= metadata.padding,
-            "Shift must be less than or equal to padding"
-        );
+        if metadata.store_pad {
+            ensure!(
+                read_opts.shift_width <= metadata.padding,
+                "Shift must be less than or equal to padding"
+            );
+        }
 
         let mut aggregate_size = None;
         let mut out_resolution = metadata.resolution;
@@ -284,8 +290,12 @@ impl DataStore {
         }
         let seq_start = (shift + self.n_pad() as i32) as usize;
         let seq_end = seq_start + self.sequence_length() as usize;
-        let arr_start = seq_start / res as usize;
-        let arr_end = seq_end / res as usize;
+        let arr_start = if self.inner.metadata.store_pad {
+            seq_start / res as usize
+        } else {
+            0
+        };
+        let arr_end = arr_start + (self.sequence_length() / res) as usize;
         let mut seq = seq.slice(s![.., seq_start..seq_end]);
         let mut arr = arr.slice(s![.., arr_start..arr_end, ..]).to_owned();
 
@@ -392,6 +402,7 @@ pub struct DataStoreBuilder {
     sequence_length: u32,
     resolution: u32,
     padding: u32,
+    store_pad: bool,
     pub(crate) segments: IndexMap<GenomicRange, PathBuf>,
     pub(crate) data_keys: IndexSet<String>,
 }
@@ -403,6 +414,7 @@ impl DataStoreBuilder {
         sequence_length: u32,
         resolution: u32,
         padding: u32,
+        store_pad: bool,
     ) -> Result<Self> {
         ensure!(
             sequence_length % resolution == 0,
@@ -424,6 +436,7 @@ impl DataStoreBuilder {
             sequence_length,
             resolution,
             padding,
+            store_pad,
         })
     }
 
@@ -506,7 +519,11 @@ impl DataStoreBuilder {
         }
         self.data_keys.insert(key);
 
-        let val_len = (self.total_sequence_length() / self.resolution) as usize;
+        let val_len = if self.store_pad {
+            (self.total_sequence_length() / self.resolution) as usize
+        } else {
+            (self.sequence_length / self.resolution) as usize
+        };
         let chunk_size = (data.len() / 32).max(1);
         data.chunks(chunk_size).try_for_each(|chunk| {
             chunk.into_iter().try_for_each(|(range, values)| {
@@ -557,12 +574,21 @@ impl DataStoreBuilder {
             .collect::<Result<HashMap<_, _>>>()?;
 
         let padding = self.padding as isize;
-        let seq_len = self.total_sequence_length() as isize;
+        let seq_len_total = self.total_sequence_length() as isize;
+        let seq_len_core = self.sequence_length as isize;
         let resolution = self.resolution as usize;
-        let values = regions.into_par_iter().map(|range| {
+        let store_pad = self.store_pad;
+        let values = regions.into_par_iter().map(move |range| {
             let values = data.get(range.chrom()).unwrap();
-            let start = range.start() as isize - padding;
-            let end = start + seq_len;
+            let (start, end) = if store_pad {
+                let start = range.start() as isize - padding;
+                let end = start + seq_len_total;
+                (start, end)
+            } else {
+                let start = range.start() as isize;
+                let end = start + seq_len_core;
+                (start, end)
+            };
             let mut output_vec = slice_pad(values, start, end, bf16::ZERO);
 
             if resolution > 1 {
@@ -641,6 +667,7 @@ impl DataStoreBuilder {
             sequence_length: self.sequence_length,
             resolution: self.resolution,
             padding: self.padding,
+            store_pad: self.store_pad,
         };
         let metadata_byes = metadata.encode()?;
         store.write_all(&metadata_byes)?;
@@ -900,7 +927,7 @@ mod tests {
         let mut rng = rand::rng();
         let temp_dir = tempfile::tempdir().unwrap();
         let tmp = temp_dir.as_ref().join("store_builder");
-        let mut store = DataStoreBuilder::new(&tmp, sequence_length, resolution, padding).unwrap();
+        let mut store = DataStoreBuilder::new(&tmp, sequence_length, resolution, padding, true).unwrap();
 
         let random_regions = (0..n_segments)
             .map(|i| {
