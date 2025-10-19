@@ -44,6 +44,10 @@ use crate::w5z::W5Z;
         The amount of padding to add around each genomic segment (default is 0).
         Extra padding allows shifting the window within the padded region during
         data loading.
+    store_pad
+        Whether to store the padding region in the data store (default is True).
+        When True, allows for random shifting during data loading for data augmentation.
+        When False, saves storage space but disables shifting functionality.
     chroms
         A list of chromosomes to include in the dataset. If None, all chromosomes in the FASTA file will be used.
     temp_dir
@@ -58,7 +62,7 @@ use crate::w5z::W5Z;
     >>> from gdata import as GenomeDataBuilder
     >>> regions = ["chr11:35041782-35238390", "chr11:35200000-35300000"]
     >>> tracks = {'DNase:CD14-positive monocyte': 'ENCSR464ETX.w5z', 'DNase:keratinocyte': 'ENCSR000EPQ.w5z'}
-    >>> builder = GenomeDataBuilder("genome.gdata", 'genome.fa.gz', segments=regions, window_size=196_608, resolution=128)
+    >>> builder = GenomeDataBuilder("genome.gdata", 'genome.fa.gz', segments=regions, window_size=196_608, resolution=128, store_pad=True)
     >>> builder.add_files(tracks)
     >>> builder.finish()
 */
@@ -88,10 +92,10 @@ impl GenomeDataBuilder {
     #[pyo3(
         signature = (
             location, genome_fasta, window_size, *, segments=None, step_size=None, resolution=32,
-            padding=0, chroms=None, temp_dir=None,
+            padding=0, store_pad=true, chroms=None, temp_dir=None,
         ),
         text_signature = "($self, location, genome_fasta, window_size, *, segments=None,
-            step_size=None, resolution=32, padding=0, chroms=None, temp_dir=None)"
+            step_size=None, resolution=32, padding=0, store_pad=true, chroms=None, temp_dir=None)"
     )]
     pub fn new(
         location: PathBuf,
@@ -101,6 +105,7 @@ impl GenomeDataBuilder {
         step_size: Option<u32>,
         resolution: u32,
         padding: u32,
+        store_pad: bool,
         chroms: Option<Vec<String>>,
         temp_dir: Option<PathBuf>,
     ) -> Result<Self> {
@@ -114,7 +119,7 @@ impl GenomeDataBuilder {
             window_size,
             resolution,
             padding,
-            true,
+            store_pad,
         )?;
         let mut fasta_reader = open_fasta(genome_fasta)?;
 

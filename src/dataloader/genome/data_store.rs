@@ -108,6 +108,8 @@ impl StoreMetadata {
 pub struct DataStoreReadOptions {
     /// Random shift to apply to the sequence from -shift_width to +shift_width.
     pub shift_width: u32,
+    /// Additional padding to extend sequences beyond segment boundaries.
+    pub sequence_padding: u32,
     /// Length of the values to read.
     pub value_length: Option<u32>,
     /// Size of the split values.
@@ -126,6 +128,7 @@ impl Default for DataStoreReadOptions {
     fn default() -> Self {
         Self {
             shift_width: 0,
+            sequence_padding: 0,
             value_length: None,
             split_size: None,
             read_resolution: None,
@@ -288,14 +291,29 @@ impl DataStore {
         if self.read_opts.shift_width != 0 {
             shift = self.read_opts.rng.random_range(-shift..=shift) / res as i32 * res as i32;
         }
-        let seq_start = (shift + self.n_pad() as i32) as usize;
-        let seq_end = seq_start + self.sequence_length() as usize;
+        
+        // Calculate sequence boundaries with additional padding
+        let padding = self.read_opts.sequence_padding as i32;
+        let base_start = (shift + self.n_pad() as i32) as i32;
+        let seq_start = (base_start - padding).max(0) as usize;
+        let seq_len_with_padding = self.sequence_length() as usize + (2 * padding) as usize;
+        let seq_end = (seq_start + seq_len_with_padding).min(seq.len_of(Axis(1)));
+        
         let arr_start = if self.inner.metadata.store_pad {
             seq_start / res as usize
         } else {
             0
         };
-        let arr_end = arr_start + (self.sequence_length() / res) as usize;
+        let arr_len_base = (self.sequence_length() / res) as usize;
+        let arr_len_with_padding = if self.inner.metadata.store_pad {
+            // When store_pad=true, we can extend values according to sequence padding
+            arr_len_base + (2 * padding / res as i32) as usize
+        } else {
+            // When store_pad=false, values don't have padding, so keep original length
+            arr_len_base
+        };
+        let arr_end = (arr_start + arr_len_with_padding).min(arr.len_of(Axis(1)));
+        
         let mut seq = seq.slice(s![.., seq_start..seq_end]);
         let mut arr = arr.slice(s![.., arr_start..arr_end, ..]).to_owned();
 

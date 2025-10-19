@@ -33,15 +33,15 @@ use crate::dataloader::genome::data_store::{decode_nucleotide, DataStore, DataSt
         The resolution of the genomic data. If not provided, it defaults to the dataset's resolution.
         If the resolution is provided, it must be a multiple of the dataset's resolution.
         The values will be aggregated (by taking the average) to this resolution.
-    trim_target: Optional[int]
-        Trim both ends of the target vector according to the `trim_target` parameter.
-        As a result, the length of the values will be reduced by `2 * trim_target`.
-        The unit of `trim_target` is base pairs, and it must be a multiple of the resolution.
+    target_length: Optional[int]
+        The length of the target values to return, in base pairs. Must be a multiple of
+        the resolution. If smaller than the window size, the values will be trimmed 
+        symmetrically from both ends to achieve the target length.
         Note this only affects the values, not the sequences. The sequences will always
-        have the full length as defined in the dataset.
+        have the full length as defined in the dataset (plus any additional padding).
         This is useful when you want to compute the loss on only the central part of the sequence.
-        This is because the edges of the sequence may contain
-        padding or other artifacts that should not be considered in the loss computation.
+        This is because the edges of the sequence may contain padding or other artifacts 
+        that should not be considered in the loss computation.
     scale : Optional[float]
         Scale the values by this factor. If not provided, no scaling is applied.
     clamp_max : Optional[float]
@@ -60,6 +60,10 @@ use crate::dataloader::genome::data_store::{decode_nucleotide, DataStore, DataSt
         The actual shift will be randomly chosen from the range [-random_shift, random_shift].
         This is useful for data augmentation, as it introduces variability in the sequences
         retrieved from the dataset.
+    padding: int
+        Additional padding (in base pairs) to extend sequences beyond segment boundaries.
+        The returned sequences will be extended by this amount on both ends, providing
+        extra context around each genomic segment. Default is 0 (no additional padding).
     seq_as_string : bool
         If True, sequences will be returned as strings instead of numpy integer arrays.
         This is useful for cases where you want to work with the sequences as text,
@@ -80,7 +84,7 @@ use crate::dataloader::genome::data_store::{decode_nucleotide, DataStore, DataSt
     Examples
     --------
     >>> from gdata import as GenomeDataLoader
-    >>> loader = GenomeDataLoader("test_genome", trim_target=40_960)
+    >>> loader = GenomeDataLoader("test_genome", target_length=40_960, padding=5000)
     >>> region = 'chr11:35041782-35238390'
     >>> tracks = ['DNase:CD14-positive monocyte', 'DNase:keratinocyte', 'ChIP-H3K27ac:keratinocyte']
     >>> loader.plot(region, tracks, savefig="signal.png")
@@ -227,12 +231,12 @@ impl GenomeDataLoader {
     #[pyo3(
         signature = (location, *,
             batch_size=8, resolution=None, target_length=None, scale=None, clamp_max=None,
-            window_size=None, shuffle=false, random_shift=0, seq_as_string=false, n_jobs=8,
+            window_size=None, shuffle=false, random_shift=0, padding=0, seq_as_string=false, n_jobs=8,
             random_seed=2025,
         ),
         text_signature = "($self, location, *,
             batch_size=8, resolution=None, target_length=None, scale=None, clamp_max=None,
-            window_size=None, shuffle=False, random_shift=0, seq_as_string=False, n_jobs=8,
+            window_size=None, shuffle=False, random_shift=0, padding=0, seq_as_string=False, n_jobs=8,
             random_seed=2025)"
     )]
     pub fn new(
@@ -245,19 +249,20 @@ impl GenomeDataLoader {
         window_size: Option<u32>,
         shuffle: bool,
         random_shift: u32,
+        padding: u32,
         seq_as_string: bool,
         n_jobs: usize,
         random_seed: u64,
     ) -> Result<Self> {
         let store_opts = DataStoreReadOptions {
             shift_width: random_shift,
+            sequence_padding: padding,
             value_length: target_length,
             split_size: window_size,
             read_resolution: resolution,
             scale_value: scale.map(|x| bf16::from_f32(x)),
             clamp_value_max: clamp_max.map(|x| bf16::from_f32(x)),
             rng: ChaCha12Rng::seed_from_u64(random_seed),
-            ..Default::default()
         };
 
         let loader = Self {

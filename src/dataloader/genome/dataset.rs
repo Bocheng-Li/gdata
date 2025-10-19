@@ -64,6 +64,7 @@ impl GenomeDataset {
     ) -> Result<Self> {
         let store_opts = DataStoreReadOptions {
             shift_width: random_shift,
+            sequence_padding: 0,
             value_length: target_length,
             split_size: window_size,
             read_resolution: resolution,
