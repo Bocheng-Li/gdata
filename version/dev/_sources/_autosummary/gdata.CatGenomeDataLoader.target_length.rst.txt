@@ -1,0 +1,6 @@
+gdata.CatGenomeDataLoader.target\_length
+========================================
+
+.. currentmodule:: gdata
+
+.. autoattribute:: CatGenomeDataLoader.target_length

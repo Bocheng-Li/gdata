@@ -1,0 +1,6 @@
+gdata.GenomeDataLoaderMap.resolution
+====================================
+
+.. currentmodule:: gdata
+
+.. autoattribute:: GenomeDataLoaderMap.resolution

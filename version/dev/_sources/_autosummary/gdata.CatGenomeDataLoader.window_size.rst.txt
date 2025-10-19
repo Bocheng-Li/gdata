@@ -1,0 +1,6 @@
+gdata.CatGenomeDataLoader.window\_size
+======================================
+
+.. currentmodule:: gdata
+
+.. autoattribute:: CatGenomeDataLoader.window_size

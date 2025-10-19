@@ -1,0 +1,6 @@
+gdata.CatGenomeDataLoader.resolution
+====================================
+
+.. currentmodule:: gdata
+
+.. autoattribute:: CatGenomeDataLoader.resolution
