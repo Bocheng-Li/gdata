@@ -1,6 +1,6 @@
-pub mod w5z;
 pub mod dataloader;
 pub mod utils;
+pub mod w5z;
 
 use pyo3::prelude::*;
 use std::io::Write;
@@ -36,8 +36,18 @@ fn gdata(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<dataloader::generic::PyArrayDataLoader>()?;
     m.add_class::<dataloader::genome::GenomeDataBuilder>()?;
     m.add_class::<dataloader::genome::GenomeDataLoader>()?;
+    m.add_class::<dataloader::genome::GenomeDataLoaderAugmentedBFloat16DLPackIter>()?;
+    m.add_class::<dataloader::genome::GenomeDataLoaderBFloat16DLPackIter>()?;
     m.add_class::<dataloader::genome::GenomeDataLoaderMap>()?;
+    m.add_class::<dataloader::genome::MultiAugmentedBFloat16DLPackIter>()?;
+    m.add_class::<dataloader::genome::MultiBFloat16DLPackIter>()?;
     m.add_class::<dataloader::genome::CatGenomeDataLoader>()?;
+    m.add_function(wrap_pyfunction!(
+        dataloader::genome::convert_tfrecord_to_gdata,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(dataloader::genome::profile_reset, m)?)?;
+    m.add_function(wrap_pyfunction!(dataloader::genome::profile_snapshot, m)?)?;
 
     utils::register_utils(m)?;
 

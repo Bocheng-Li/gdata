@@ -1,18 +1,451 @@
 use anyhow::{ensure, Context, Result};
-use bed_utils::bed::GenomicRange;
+use bed_utils::bed::{BEDLike, GenomicRange};
 use half::bf16;
 use indexmap::IndexMap;
 use itertools::Itertools;
 use ndarray::{Array2, Array3, Axis};
 use numpy::{PyArray2, PyArray3};
 use pyo3::{prelude::*, py_run};
-use rand::SeedableRng;
+use rand::seq::SliceRandom;
+use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha12Rng;
 use std::str::FromStr;
 use std::{collections::HashSet, path::PathBuf};
 
-use super::super::generic::PrefethIterator;
-use crate::dataloader::genome::data_store::{decode_nucleotide, DataStore, DataStoreReadOptions};
+use super::super::generic::{ParallelLoader, PrefethIterator};
+use crate::dataloader::genome::data_store::{
+    decode_nucleotide, DataStore, DataStoreBf16ParentRegionIter, DataStoreReadOptions,
+};
+use crate::dataloader::genome::dlpack::into_dlpack;
+
+/// A parent record together with the arrays needed by the native augmentation
+/// path.  The genomic range is retained so that the output coordinates can be
+/// updated after the center crop and split.
+type RegionBFloat16Record = (GenomicRange, u64, Array2<u8>, Array3<bf16>);
+
+/// Metadata for one output segment.  The second field is the signed shift in
+/// base pairs relative to the center of the parent record; the third field is
+/// the segment's logical index before the random output ordering is applied.
+type AugmentedSegmentMetadata = (String, i64, usize);
+
+type AugmentedBFloat16Record = (Array2<u8>, Array3<bf16>, Vec<AugmentedSegmentMetadata>);
+
+#[derive(Debug, Clone, Copy)]
+struct CenterSplitConfig {
+    /// Length of the centered window to retain, in base pairs.
+    center_length: u32,
+    /// Maximum symmetric shift requested by the caller, in base pairs.
+    shift_width: u32,
+    /// Number of equal output segments.
+    num_segments: usize,
+    /// Resolution of the values returned by the loader.
+    resolution: u32,
+}
+
+/// Validate the options shared by the single- and multi-loader native
+/// augmentation APIs.
+fn center_split_config(
+    store: &DataStore,
+    center_length: Option<u32>,
+    shift_width: u32,
+    num_segments: Option<usize>,
+) -> Result<CenterSplitConfig> {
+    // The new operation is deliberately defined on a complete parent record.
+    // Applying an existing split/trim/aggregation first would make the
+    // available flank ambiguous and would also make coordinates inaccurate.
+    ensure!(
+        store.read_opts.split_size.is_none(),
+        "center/split augmentation cannot be combined with window_size"
+    );
+    ensure!(
+        store.read_opts.value_length.is_none(),
+        "center/split augmentation cannot be combined with target_length"
+    );
+    ensure!(
+        !store.has_aggregation(),
+        "center/split augmentation requires the stored resolution"
+    );
+    ensure!(
+        store.read_opts.shift_width == 0,
+        "center/split augmentation requires random_shift=0 on the loader"
+    );
+    ensure!(
+        store.read_opts.scale_value.is_none() && store.read_opts.clamp_value_max.is_none(),
+        "center/split augmentation cannot be combined with scale or clamp"
+    );
+
+    let center_length = center_length.unwrap_or(store.sequence_length());
+    let num_segments = num_segments.unwrap_or(1);
+    ensure!(
+        num_segments <= u32::MAX as usize,
+        "segments_length is too large"
+    );
+    let num_segments_u32 = num_segments as u32;
+    ensure!(center_length > 0, "center_length must be positive");
+    ensure!(num_segments > 0, "segments_length must be positive");
+    ensure!(
+        center_length % num_segments_u32 == 0,
+        "center_length must be divisible by segments_length"
+    );
+    let physical_parent_length = store
+        .sequence_length()
+        .checked_add(store.n_pad().saturating_mul(2))
+        .ok_or_else(|| anyhow::anyhow!("parent sequence length overflows u32"))?;
+    ensure!(
+        center_length <= physical_parent_length,
+        "center_length cannot exceed the parent sequence length"
+    );
+    ensure!(
+        center_length % store.out_resolution == 0,
+        "center_length must be a multiple of the output resolution"
+    );
+    ensure!(
+        (center_length / num_segments_u32) % store.out_resolution == 0,
+        "each output segment must be a multiple of the output resolution"
+    );
+    ensure!(
+        shift_width % store.out_resolution == 0,
+        "shift must be a multiple of the output resolution"
+    );
+
+    Ok(CenterSplitConfig {
+        center_length,
+        shift_width,
+        num_segments,
+        resolution: store.out_resolution,
+    })
+}
+
+/// Crop a complete parent record around its center, apply one shared random
+/// shift, and split the selected window into equal segments.
+///
+/// The requested shift is automatically limited by the actual extra sequence
+/// present in the parent.  This is what permits `padding=0` gdata records to
+/// provide augmentation as long as their stored sequence is longer than the
+/// requested center window.
+#[derive(Debug, Clone)]
+struct CenterSplitPlan {
+    start: usize,
+    shift: i64,
+    segment_length: usize,
+    order: Vec<usize>,
+}
+
+fn make_center_split_plan(
+    parent_length: usize,
+    config: CenterSplitConfig,
+    rng: &mut ChaCha12Rng,
+) -> Result<CenterSplitPlan> {
+    let center_length = config.center_length as usize;
+    ensure!(
+        parent_length >= center_length,
+        "parent length {} is shorter than center_length {}",
+        parent_length,
+        center_length
+    );
+    let extra = parent_length - center_length;
+    ensure!(
+        parent_length % config.resolution as usize == 0,
+        "parent length must be a multiple of the output resolution"
+    );
+    let extra_bins = extra / config.resolution as usize;
+    let maximum_symmetric_shift = (extra_bins / 2) * config.resolution as usize;
+    // A no-padding parent can still contain extra context.  Use as much of
+    // the requested shift as the actual parent permits, instead of requiring
+    // callers to know the physical record length in advance.
+    let effective_shift = config.shift_width.min(maximum_symmetric_shift as u32);
+    let shift_bins = (effective_shift / config.resolution) as i64;
+    let shift = if shift_bins == 0 {
+        0
+    } else {
+        rng.random_range(-shift_bins..=shift_bins) * config.resolution as i64
+    };
+    let center_start = (extra_bins / 2) * config.resolution as usize;
+    let start = (center_start as i64 + shift) as usize;
+    let end = start + center_length;
+    ensure!(
+        end <= parent_length,
+        "computed center crop [{start}, {end}) exceeds parent length {parent_length}"
+    );
+
+    let mut order: Vec<usize> = (0..config.num_segments).collect();
+    order.shuffle(rng);
+    Ok(CenterSplitPlan {
+        start,
+        shift,
+        segment_length: center_length / config.num_segments,
+        order,
+    })
+}
+
+fn apply_center_split_plan(
+    region: GenomicRange,
+    physical_start: u64,
+    sequence: Array2<u8>,
+    values: Array3<bf16>,
+    config: CenterSplitConfig,
+    channels_last: bool,
+    plan: &CenterSplitPlan,
+) -> Result<AugmentedBFloat16Record> {
+    ensure!(
+        sequence.ndim() == 2 && sequence.shape()[0] == 1,
+        "native center/split expects a parent batch of one"
+    );
+    ensure!(
+        values.ndim() == 3 && values.shape()[0] == 1,
+        "native center/split expects values with batch size one"
+    );
+
+    let parent_length = sequence.shape()[1];
+    let parent_value_length = parent_length / config.resolution as usize;
+    let n_tracks = if channels_last {
+        ensure!(
+            values.shape()[1] == parent_value_length,
+            "channels-last values do not match sequence length"
+        );
+        values.shape()[2]
+    } else {
+        ensure!(
+            values.shape()[2] == parent_value_length,
+            "channels-first values do not match sequence length"
+        );
+        values.shape()[1]
+    };
+
+    let output_sequence = split_sequence_with_plan(&sequence, config, plan);
+    let output_values = split_values_with_plan(&values, config, channels_last, plan, n_tracks);
+    let metadata = segment_metadata(&region, physical_start, plan);
+
+    Ok((output_sequence, output_values, metadata))
+}
+
+fn split_sequence_with_plan(
+    sequence: &Array2<u8>,
+    config: CenterSplitConfig,
+    plan: &CenterSplitPlan,
+) -> Array2<u8> {
+    let mut output = Array2::<u8>::zeros((config.num_segments, plan.segment_length));
+    for (output_index, &chunk_index) in plan.order.iter().enumerate() {
+        let chunk_start = plan.start + chunk_index * plan.segment_length;
+        let chunk_end = chunk_start + plan.segment_length;
+        output
+            .slice_mut(ndarray::s![output_index, ..])
+            .assign(&sequence.slice(ndarray::s![0, chunk_start..chunk_end]));
+    }
+    output
+}
+
+fn split_values_with_plan(
+    values: &Array3<bf16>,
+    config: CenterSplitConfig,
+    channels_last: bool,
+    plan: &CenterSplitPlan,
+    n_tracks: usize,
+) -> Array3<bf16> {
+    let resolution = config.resolution as usize;
+    let segment_value_length = plan.segment_length / resolution;
+    let mut output = if channels_last {
+        Array3::<bf16>::from_elem(
+            (config.num_segments, segment_value_length, n_tracks),
+            bf16::from_f32(0.0),
+        )
+    } else {
+        Array3::<bf16>::from_elem(
+            (config.num_segments, n_tracks, segment_value_length),
+            bf16::from_f32(0.0),
+        )
+    };
+    for (output_index, &chunk_index) in plan.order.iter().enumerate() {
+        let chunk_start = (plan.start + chunk_index * plan.segment_length) / resolution;
+        let chunk_end = chunk_start + segment_value_length;
+        if channels_last {
+            output
+                .slice_mut(ndarray::s![output_index, .., ..])
+                .assign(&values.slice(ndarray::s![0, chunk_start..chunk_end, ..]));
+        } else {
+            output
+                .slice_mut(ndarray::s![output_index, .., ..])
+                .assign(&values.slice(ndarray::s![0, .., chunk_start..chunk_end]));
+        }
+    }
+    output
+}
+
+fn segment_metadata(
+    region: &GenomicRange,
+    physical_start: u64,
+    plan: &CenterSplitPlan,
+) -> Vec<AugmentedSegmentMetadata> {
+    plan.order
+        .iter()
+        .map(|&chunk_index| {
+            let chunk_start = plan.start + chunk_index * plan.segment_length;
+            let genomic_start = physical_start + chunk_start as u64;
+            let genomic_end = genomic_start + plan.segment_length as u64;
+            (
+                format!("{}:{}-{}", region.chrom(), genomic_start, genomic_end),
+                plan.shift,
+                chunk_index,
+            )
+        })
+        .collect()
+}
+
+fn center_split_record(
+    region: GenomicRange,
+    physical_start: u64,
+    sequence: Array2<u8>,
+    values: Array3<bf16>,
+    config: CenterSplitConfig,
+    channels_last: bool,
+    rng: &mut ChaCha12Rng,
+) -> Result<AugmentedBFloat16Record> {
+    ensure!(
+        sequence.ndim() == 2 && sequence.shape()[0] == 1,
+        "native center/split expects a parent batch of one"
+    );
+    let plan = make_center_split_plan(sequence.shape()[1], config, rng)?;
+    apply_center_split_plan(
+        region,
+        physical_start,
+        sequence,
+        values,
+        config,
+        channels_last,
+        &plan,
+    )
+}
+
+#[cfg(test)]
+mod center_split_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn test_region() -> GenomicRange {
+        GenomicRange::from_str("chr1:100-112").unwrap()
+    }
+
+    fn test_sequence() -> Array2<u8> {
+        Array2::from_shape_fn((1, 12), |(_, i)| i as u8)
+    }
+
+    fn test_values() -> Array3<bf16> {
+        Array3::from_shape_fn((1, 1, 12), |(_, _, i)| bf16::from_f32(i as f32))
+    }
+
+    #[test]
+    fn shift_is_limited_by_the_available_symmetric_flank() {
+        let config = CenterSplitConfig {
+            center_length: 8,
+            shift_width: 100,
+            num_segments: 2,
+            resolution: 1,
+        };
+        let mut rng = ChaCha12Rng::seed_from_u64(7);
+        for _ in 0..100 {
+            let plan = make_center_split_plan(12, config, &mut rng).unwrap();
+            assert!((-2..=2).contains(&plan.shift));
+            assert!(plan.start <= 4);
+            assert!(plan.start + config.center_length as usize <= 12);
+        }
+    }
+
+    #[test]
+    fn center_crop_split_and_coordinates_are_consistent() {
+        let config = CenterSplitConfig {
+            center_length: 8,
+            shift_width: 0,
+            num_segments: 4,
+            resolution: 1,
+        };
+        let mut rng = ChaCha12Rng::seed_from_u64(9);
+        let (sequence, values, metadata) = center_split_record(
+            test_region(),
+            100,
+            test_sequence(),
+            test_values(),
+            config,
+            false,
+            &mut rng,
+        )
+        .unwrap();
+
+        assert_eq!(sequence.shape(), &[4, 2]);
+        assert_eq!(values.shape(), &[4, 1, 2]);
+        assert_eq!(metadata.len(), 4);
+        let mut seen = HashSet::new();
+        for (row, (name, shift, chunk_index)) in metadata.iter().enumerate() {
+            assert_eq!(*shift, 0);
+            assert!(seen.insert(*chunk_index));
+            let chunk_start = 2 + chunk_index * 2;
+            assert_eq!(sequence[[row, 0]], chunk_start as u8);
+            assert_eq!(sequence[[row, 1]], (chunk_start + 1) as u8);
+            assert_eq!(values[[row, 0, 0]].to_f32(), chunk_start as f32);
+            assert_eq!(
+                name,
+                &format!("chr1:{}-{}", 100 + chunk_start, 100 + chunk_start + 2)
+            );
+        }
+        assert_eq!(seen, HashSet::from([0, 1, 2, 3]));
+    }
+
+    #[test]
+    fn values_are_split_in_bins_when_resolution_is_greater_than_one() {
+        let config = CenterSplitConfig {
+            center_length: 8,
+            shift_width: 0,
+            num_segments: 2,
+            resolution: 2,
+        };
+        let sequence = Array2::from_shape_fn((1, 12), |(_, i)| i as u8);
+        let values = Array3::from_shape_fn((1, 1, 6), |(_, _, i)| bf16::from_f32(i as f32));
+        let mut rng = ChaCha12Rng::seed_from_u64(11);
+        let (sequence, values, metadata) = center_split_record(
+            test_region(),
+            100,
+            sequence,
+            values,
+            config,
+            false,
+            &mut rng,
+        )
+        .unwrap();
+        assert_eq!(sequence.shape(), &[2, 4]);
+        assert_eq!(values.shape(), &[2, 1, 2]);
+        for (row, (_, _, chunk_index)) in metadata.iter().enumerate() {
+            let value_start = 1 + chunk_index * 2;
+            assert_eq!(values[[row, 0, 0]].to_f32(), value_start as f32);
+        }
+    }
+
+    #[test]
+    fn multi_record_uses_one_plan_for_all_modalities() {
+        let config = CenterSplitConfig {
+            center_length: 8,
+            shift_width: 2,
+            num_segments: 2,
+            resolution: 1,
+        };
+        let mut values = IndexMap::new();
+        values.insert("atac".to_string(), test_values());
+        values.insert("dnase".to_string(), test_values());
+        let mut rng = ChaCha12Rng::seed_from_u64(13);
+        let (sequence, output, metadata) = center_split_multi_record(
+            test_region(),
+            100,
+            test_sequence(),
+            values,
+            config,
+            false,
+            &mut rng,
+        )
+        .unwrap();
+        assert_eq!(output["atac"], output["dnase"]);
+        assert_eq!(sequence.shape(), &[2, 4]);
+        assert_eq!(metadata.len(), 2);
+        assert_eq!(metadata[0].1, metadata[1].1);
+    }
+}
 
 /** A dataloader for genomic data, allowing for efficient retrieval of genomic
     sequences and their associated values.
@@ -32,7 +465,9 @@ use crate::dataloader::genome::data_store::{decode_nucleotide, DataStore, DataSt
     resolution : Optional[int]
         The resolution of the genomic data. If not provided, it defaults to the dataset's resolution.
         If the resolution is provided, it must be a multiple of the dataset's resolution.
-        The values will be aggregated (by taking the average) to this resolution.
+        The values will be aggregated (by taking the average) to this resolution when it is
+        higher than the dataset's resolution. Requesting the dataset's native resolution does
+        not perform an identity aggregation pass.
     trim_target: Optional[int]
         Trim both ends of the target vector according to the `trim_target` parameter.
         As a result, the length of the values will be reduced by `2 * trim_target`.
@@ -47,6 +482,8 @@ use crate::dataloader::genome::data_store::{decode_nucleotide, DataStore, DataSt
     clamp_max : Optional[float]
         Clamp the values to this maximum value. If not provided, no clamping is applied.
         If `scale` is also provided, the clamping will be applied after scaling.
+        If neither `scale` nor `clamp_max` is provided, no value transformation or NaN scan is
+        performed.
     window_size : Optional[int]
         The window size for retrieving genomic sequences. The loader's window size
         can be different from the underlying dataset's window size so that the same
@@ -99,6 +536,7 @@ pub struct GenomeDataLoader {
     shuffle: bool,
     seq_as_string: bool,
     n_jobs: usize,
+    random_seed: u64,
 }
 
 impl std::fmt::Display for GenomeDataLoader {
@@ -188,7 +626,49 @@ impl GenomeDataLoader {
         loader
     }
 
+    fn ordered_regions(&self) -> Vec<GenomicRange> {
+        let mut regions = self
+            .subset
+            .clone()
+            .unwrap_or_else(|| self.data_store.segments().cloned().collect());
+        if self.shuffle {
+            let mut rng = ChaCha12Rng::seed_from_u64(self.random_seed);
+            regions.shuffle(&mut rng);
+        }
+        regions
+    }
+
+    fn raw_region_bfloat16_iterator(
+        &self,
+        regions: Vec<GenomicRange>,
+        channels_last: bool,
+    ) -> ParallelLoader<DataStoreBf16ParentRegionIter, RegionBFloat16Record> {
+        self.data_store
+            .clone()
+            .par_iter_bf16_parent_with_layout_and_regions(regions, self.n_jobs, channels_last)
+    }
+
+    fn center_split_config(
+        &self,
+        center_length: Option<u32>,
+        shift_width: u32,
+        num_segments: Option<usize>,
+    ) -> Result<CenterSplitConfig> {
+        center_split_config(&self.data_store, center_length, shift_width, num_segments)
+    }
+
     pub fn iter(&mut self) -> GenomeDataLoaderIter {
+        // Keep the default compatible with the historical loader while making
+        // the queue depth tunable for large compressed records.  A larger
+        // queue can hide bursty decompression latency, at the cost of holding
+        // more decoded batches in memory.  This is intentionally an
+        // environment variable so existing Python APIs and data files remain
+        // compatible.
+        let prefetch_multiplier = std::env::var("GDATA_PREFETCH_MULTIPLIER")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(2);
         let iter = PrefethIterator::new(
             self.data_store.par_iter(
                 self.batch_size,
@@ -196,13 +676,103 @@ impl GenomeDataLoader {
                 self.shuffle,
                 self.subset.as_ref().map(|x| x.as_slice()),
             ),
-            self.n_jobs * 2,
+            self.n_jobs.saturating_mul(prefetch_multiplier),
         );
 
         GenomeDataLoaderIter {
             iter,
             seq_as_string: self.seq_as_string,
         }
+    }
+
+    /// Iterate over owned bfloat16 values exposed as DLPack capsules.
+    ///
+    /// The regular [`iter`](Self::iter) API is intentionally kept unchanged
+    /// for NumPy users.  This opt-in iterator is used by the PyTorch training
+    /// path and avoids both the Rust bfloat16-to-float32 conversion and the
+    /// subsequent Python float32-to-bfloat16 conversion.
+    pub fn iter_bfloat16_dlpack(&mut self) -> GenomeDataLoaderBFloat16DLPackIter {
+        self.iter_bfloat16_dlpack_with_layout(true)
+    }
+
+    /// Iterate over native bfloat16 values with an explicit channel layout.
+    ///
+    /// `channels_last=true` yields values shaped `(batch, sequence, track)`.
+    /// `channels_last=false` yields `(batch, track, sequence)` and lets the
+    /// reader reuse the decoded track-major allocation when no crop or other
+    /// sequence transform is needed.
+    pub fn iter_bfloat16_dlpack_with_layout(
+        &mut self,
+        channels_last: bool,
+    ) -> GenomeDataLoaderBFloat16DLPackIter {
+        let prefetch_multiplier = std::env::var("GDATA_PREFETCH_MULTIPLIER")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(2);
+        let iter = PrefethIterator::new(
+            self.data_store.par_iter_bf16_with_layout(
+                self.batch_size,
+                self.n_jobs,
+                self.shuffle,
+                self.subset.as_ref().map(|x| x.as_slice()),
+                channels_last,
+            ),
+            self.n_jobs.saturating_mul(prefetch_multiplier),
+        );
+
+        GenomeDataLoaderBFloat16DLPackIter {
+            iter,
+            seq_as_string: self.seq_as_string,
+        }
+    }
+
+    /// Iterate over native bfloat16 data after a runtime center crop and
+    /// equal split.  The parent record is not required to declare gdata
+    /// padding: any extra bases physically present in the parent are used as
+    /// the available shift flank.
+    ///
+    /// Each yielded item contains arrays for all output segments from one
+    /// parent and a list of `(segment_name, applied_shift, chunk_index)`
+    /// metadata tuples.  The low-level iterator reads one parent at a time so
+    /// one shared shift/order plan is unambiguous.  It does this even when
+    /// the loader was constructed with a larger ordinary `batch_size`; that
+    /// setting only affects the legacy iterator.
+    pub fn iter_bfloat16_dlpack_center_split(
+        &self,
+        channels_last: bool,
+        center_length: Option<u32>,
+        shift_width: u32,
+        num_segments: Option<usize>,
+    ) -> Result<GenomeDataLoaderAugmentedBFloat16DLPackIter> {
+        let config = self.center_split_config(center_length, shift_width, num_segments)?;
+        let seed = self.random_seed ^ 0x6a09e667f3bcc909;
+        let raw = self.raw_region_bfloat16_iterator(self.ordered_regions(), channels_last);
+        let mut rng = ChaCha12Rng::seed_from_u64(seed);
+        let augmented = raw.map(move |(region, physical_start, sequence, values)| {
+            center_split_record(
+                region,
+                physical_start,
+                sequence,
+                values,
+                config,
+                channels_last,
+                &mut rng,
+            )
+            .expect("invalid center/split augmentation record")
+        });
+        let prefetch_multiplier = std::env::var("GDATA_PREFETCH_MULTIPLIER")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(2);
+        Ok(GenomeDataLoaderAugmentedBFloat16DLPackIter {
+            iter: PrefethIterator::new(
+                augmented,
+                self.n_jobs.max(1).saturating_mul(prefetch_multiplier),
+            ),
+            seq_as_string: self.seq_as_string,
+        })
     }
 }
 
@@ -252,6 +822,7 @@ impl GenomeDataLoader {
             shuffle,
             seq_as_string,
             n_jobs,
+            random_seed,
         };
 
         Ok(loader)
@@ -598,6 +1169,31 @@ else:
         slf.iter()
     }
 
+    /// Python-facing opt-in iterator which yields DLPack capsules containing
+    /// native bfloat16 values.
+    #[pyo3(name = "iter_bfloat16_dlpack")]
+    #[pyo3(signature = (channels_last=true))]
+    fn iter_bfloat16_dlpack_py(
+        mut slf: PyRefMut<'_, Self>,
+        channels_last: bool,
+    ) -> GenomeDataLoaderBFloat16DLPackIter {
+        slf.iter_bfloat16_dlpack_with_layout(channels_last)
+    }
+
+    /// Python-facing native center/crop/split iterator.
+    #[pyo3(name = "iter_bfloat16_dlpack_center_split")]
+    #[pyo3(signature = (channels_last=false, mid=None, shift=0, segments_length=None))]
+    fn iter_bfloat16_dlpack_center_split_py(
+        slf: PyRef<'_, Self>,
+        channels_last: bool,
+        mid: Option<u32>,
+        shift: u32,
+        segments_length: Option<usize>,
+    ) -> PyResult<GenomeDataLoaderAugmentedBFloat16DLPackIter> {
+        slf.iter_bfloat16_dlpack_center_split(channels_last, mid, shift, segments_length)
+            .map_err(Into::into)
+    }
+
     fn __repr__(&self) -> String {
         self.to_string()
     }
@@ -641,6 +1237,95 @@ impl GenomeDataLoaderIter {
             (seq, values).into_pyobject(py).unwrap()
         };
         Some(result)
+    }
+}
+
+/// Python iterator for the native bfloat16/DLPack path.
+#[pyclass]
+pub struct GenomeDataLoaderBFloat16DLPackIter {
+    iter: PrefethIterator<(Array2<u8>, Array3<bf16>)>,
+    seq_as_string: bool,
+}
+
+/// Python iterator for native center-cropped and split bfloat16 records.
+#[pyclass]
+pub struct GenomeDataLoaderAugmentedBFloat16DLPackIter {
+    iter: PrefethIterator<AugmentedBFloat16Record>,
+    seq_as_string: bool,
+}
+
+impl Iterator for GenomeDataLoaderAugmentedBFloat16DLPackIter {
+    type Item = AugmentedBFloat16Record;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (mut sequence, values, metadata) = self.iter.next()?;
+        if self.seq_as_string {
+            sequence.mapv_inplace(|x| decode_nucleotide(x).unwrap());
+        }
+        Some((sequence, values, metadata))
+    }
+}
+
+#[pymethods]
+impl GenomeDataLoaderAugmentedBFloat16DLPackIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        py: Python<'a>,
+    ) -> PyResult<Option<Bound<'a, pyo3::types::PyTuple>>> {
+        let Some((sequence, values, metadata)) = slf.next() else {
+            return Ok(None);
+        };
+        let values = into_dlpack(py, values)?;
+        let metadata = metadata.into_pyobject(py).unwrap();
+        let result = if slf.seq_as_string {
+            let sequence = seq_to_string(&sequence);
+            (sequence, values, metadata).into_pyobject(py).unwrap()
+        } else {
+            let sequence = PyArray2::from_owned_array(py, sequence);
+            (sequence, values, metadata).into_pyobject(py).unwrap()
+        };
+        Ok(Some(result))
+    }
+}
+
+impl Iterator for GenomeDataLoaderBFloat16DLPackIter {
+    type Item = (Array2<u8>, Array3<bf16>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (mut seq, values) = self.iter.next()?;
+        if self.seq_as_string {
+            seq.mapv_inplace(|x| decode_nucleotide(x).unwrap());
+        }
+        Some((seq, values))
+    }
+}
+
+#[pymethods]
+impl GenomeDataLoaderBFloat16DLPackIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        py: Python<'a>,
+    ) -> PyResult<Option<Bound<'a, pyo3::types::PyTuple>>> {
+        let Some((seq, values)) = slf.next() else {
+            return Ok(None);
+        };
+        let values = into_dlpack(py, values)?;
+        let result = if slf.seq_as_string {
+            let seq = seq_to_string(&seq);
+            (seq, values).into_pyobject(py).unwrap()
+        } else {
+            let seq = PyArray2::from_owned_array(py, seq);
+            (seq, values).into_pyobject(py).unwrap()
+        };
+        Ok(Some(result))
     }
 }
 
@@ -725,6 +1410,110 @@ impl DataIndexer {
 #[derive(Debug, Clone)]
 pub struct GenomeDataLoaderMap(IndexMap<String, GenomeDataLoader>);
 
+/// Synchronously pair region-preserving native iterators from all heads.  The
+/// parent order is supplied by the map, so every modality consumes the same
+/// genomic record before the shared center/split plan is applied.
+struct MultiRegionBFloat16Iterator {
+    iters: IndexMap<String, ParallelLoader<DataStoreBf16ParentRegionIter, RegionBFloat16Record>>,
+}
+
+impl Iterator for MultiRegionBFloat16Iterator {
+    type Item = (
+        GenomicRange,
+        u64,
+        Array2<u8>,
+        IndexMap<String, Array3<bf16>>,
+    );
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut region = None;
+        let mut physical_start = None;
+        let mut sequence = None;
+        let mut values = IndexMap::new();
+        for (tag, iter) in self.iters.iter_mut() {
+            let (current_region, current_physical_start, current_sequence, current_values) =
+                iter.next()?;
+            if let Some(expected) = region.as_ref() {
+                assert_eq!(
+                    expected, &current_region,
+                    "all genome data loaders must yield the same parent region"
+                );
+            } else {
+                region = Some(current_region.clone());
+            }
+            if let Some(expected) = physical_start {
+                assert_eq!(
+                    expected, current_physical_start,
+                    "all genome data loaders must have the same parent origin"
+                );
+            } else {
+                physical_start = Some(current_physical_start);
+            }
+            if let Some(expected) = sequence.as_ref() {
+                assert_eq!(
+                    expected, &current_sequence,
+                    "all genome data loaders must yield the same DNA sequence"
+                );
+            } else {
+                sequence = Some(current_sequence);
+            }
+            values.insert(tag.clone(), current_values);
+        }
+        Some((region?, physical_start?, sequence?, values))
+    }
+}
+
+type MultiAugmentedBFloat16Record = (
+    Array2<u8>,
+    IndexMap<String, Array3<bf16>>,
+    Vec<AugmentedSegmentMetadata>,
+);
+
+fn center_split_multi_record(
+    region: GenomicRange,
+    physical_start: u64,
+    sequence: Array2<u8>,
+    values: IndexMap<String, Array3<bf16>>,
+    config: CenterSplitConfig,
+    channels_last: bool,
+    rng: &mut ChaCha12Rng,
+) -> Result<MultiAugmentedBFloat16Record> {
+    ensure!(
+        sequence.ndim() == 2 && sequence.shape()[0] == 1,
+        "native center/split expects a parent batch of one"
+    );
+    let parent_length = sequence.shape()[1];
+    let parent_value_length = parent_length / config.resolution as usize;
+    let plan = make_center_split_plan(parent_length, config, rng)?;
+    let output_sequence = split_sequence_with_plan(&sequence, config, &plan);
+    let metadata = segment_metadata(&region, physical_start, &plan);
+    let mut output_values = IndexMap::new();
+    for (tag, current_values) in values {
+        ensure!(
+            current_values.ndim() == 3 && current_values.shape()[0] == 1,
+            "native center/split expects values with batch size one"
+        );
+        let n_tracks = if channels_last {
+            ensure!(
+                current_values.shape()[1] == parent_value_length,
+                "channels-last values do not match sequence length"
+            );
+            current_values.shape()[2]
+        } else {
+            ensure!(
+                current_values.shape()[2] == parent_value_length,
+                "channels-first values do not match sequence length"
+            );
+            current_values.shape()[1]
+        };
+        output_values.insert(
+            tag,
+            split_values_with_plan(&current_values, config, channels_last, &plan, n_tracks),
+        );
+    }
+    Ok((output_sequence, output_values, metadata))
+}
+
 impl std::fmt::Display for GenomeDataLoaderMap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         writeln!(
@@ -748,6 +1537,93 @@ impl GenomeDataLoaderMap {
             .map(|(tag, loader)| (tag.clone(), loader.iter()))
             .collect();
         MultiDataLoaderIter(iter)
+    }
+
+    pub fn iter_bfloat16_dlpack(&mut self) -> MultiBFloat16DLPackIter {
+        self.iter_bfloat16_dlpack_with_layout(true)
+    }
+
+    /// Layout-selectable native-bfloat16 iterator for synchronized loaders.
+    pub fn iter_bfloat16_dlpack_with_layout(
+        &mut self,
+        channels_last: bool,
+    ) -> MultiBFloat16DLPackIter {
+        let iter = self
+            .0
+            .iter_mut()
+            .map(|(tag, loader)| {
+                (
+                    tag.clone(),
+                    loader.iter_bfloat16_dlpack_with_layout(channels_last),
+                )
+            })
+            .collect();
+        MultiBFloat16DLPackIter(iter)
+    }
+
+    /// Iterate over synchronized heads after one shared center crop, shift,
+    /// and equal split plan has been applied to each parent.
+    pub fn iter_bfloat16_dlpack_center_split(
+        &self,
+        channels_last: bool,
+        center_length: Option<u32>,
+        shift_width: u32,
+        num_segments: Option<usize>,
+    ) -> Result<MultiAugmentedBFloat16DLPackIter> {
+        let first = self
+            .0
+            .values()
+            .next()
+            .expect("GenomeDataLoaderMap cannot be empty");
+        let config = first.center_split_config(center_length, shift_width, num_segments)?;
+
+        for loader in self.0.values() {
+            let other = loader.center_split_config(center_length, shift_width, num_segments)?;
+            ensure!(
+                other.center_length == config.center_length
+                    && other.num_segments == config.num_segments
+                    && other.resolution == config.resolution,
+                "synchronized loaders have incompatible center/split settings"
+            );
+        }
+
+        let regions = first.ordered_regions();
+        let raw_iters = self
+            .0
+            .iter()
+            .map(|(tag, loader)| {
+                (
+                    tag.clone(),
+                    loader.raw_region_bfloat16_iterator(regions.clone(), channels_last),
+                )
+            })
+            .collect();
+        let raw = MultiRegionBFloat16Iterator { iters: raw_iters };
+        let mut rng = ChaCha12Rng::seed_from_u64(first.random_seed ^ 0x6a09e667f3bcc909);
+        let augmented = raw.map(move |(region, physical_start, sequence, values)| {
+            center_split_multi_record(
+                region,
+                physical_start,
+                sequence,
+                values,
+                config,
+                channels_last,
+                &mut rng,
+            )
+            .expect("invalid synchronized center/split augmentation record")
+        });
+        let prefetch_multiplier = std::env::var("GDATA_PREFETCH_MULTIPLIER")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(2);
+        Ok(MultiAugmentedBFloat16DLPackIter {
+            iter: PrefethIterator::new(
+                augmented,
+                first.n_jobs.max(1).saturating_mul(prefetch_multiplier),
+            ),
+            seq_as_string: first.seq_as_string,
+        })
     }
 }
 
@@ -929,6 +1805,30 @@ impl GenomeDataLoaderMap {
         slf.iter()
     }
 
+    /// Python-facing multi-head DLPack iterator.
+    #[pyo3(name = "iter_bfloat16_dlpack")]
+    #[pyo3(signature = (channels_last=true))]
+    fn iter_bfloat16_dlpack_py(
+        mut slf: PyRefMut<'_, Self>,
+        channels_last: bool,
+    ) -> MultiBFloat16DLPackIter {
+        slf.iter_bfloat16_dlpack_with_layout(channels_last)
+    }
+
+    /// Python-facing synchronized center/crop/split iterator.
+    #[pyo3(name = "iter_bfloat16_dlpack_center_split")]
+    #[pyo3(signature = (channels_last=false, mid=None, shift=0, segments_length=None))]
+    fn iter_bfloat16_dlpack_center_split_py(
+        slf: PyRef<'_, Self>,
+        channels_last: bool,
+        mid: Option<u32>,
+        shift: u32,
+        segments_length: Option<usize>,
+    ) -> PyResult<MultiAugmentedBFloat16DLPackIter> {
+        slf.iter_bfloat16_dlpack_center_split(channels_last, mid, shift, segments_length)
+            .map_err(PyErr::from)
+    }
+
     fn __repr__(&self) -> String {
         self.to_string()
     }
@@ -985,6 +1885,112 @@ impl MultiDataLoaderIter {
             (seq, values).into_pyobject(py).unwrap()
         };
         Some(result)
+    }
+}
+
+/// Synchronized multi-head iterator for the native bfloat16/DLPack path.
+#[pyclass]
+pub struct MultiBFloat16DLPackIter(IndexMap<String, GenomeDataLoaderBFloat16DLPackIter>);
+
+impl Iterator for MultiBFloat16DLPackIter {
+    type Item = (Array2<u8>, IndexMap<String, Array3<bf16>>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut seqs = None;
+        let data: Option<_> = self
+            .0
+            .iter_mut()
+            .map(|(tag, iter)| {
+                let (s, d) = iter.next()?;
+                if let Some(s_) = seqs.as_ref() {
+                    assert_eq!(s_, &s, "All sequences must be the same");
+                } else {
+                    seqs = Some(s);
+                }
+                Some((tag.clone(), d))
+            })
+            .collect();
+
+        Some((seqs?, data?))
+    }
+}
+
+#[pymethods]
+impl MultiBFloat16DLPackIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        py: Python<'a>,
+    ) -> PyResult<Option<Bound<'a, pyo3::types::PyTuple>>> {
+        let Some((seq, values)) = slf.next() else {
+            return Ok(None);
+        };
+
+        let values = values
+            .into_iter()
+            .map(|(tag, value)| Ok((tag, into_dlpack(py, value)?)))
+            .collect::<PyResult<IndexMap<_, _>>>()?;
+
+        let result = if slf.0[0].seq_as_string {
+            let seq = seq_to_string(&seq);
+            (seq, values).into_pyobject(py).unwrap()
+        } else {
+            let seq = PyArray2::from_owned_array(py, seq);
+            (seq, values).into_pyobject(py).unwrap()
+        };
+        Ok(Some(result))
+    }
+}
+
+/// Synchronized multi-head iterator for native center-cropped/split records.
+#[pyclass]
+pub struct MultiAugmentedBFloat16DLPackIter {
+    iter: PrefethIterator<MultiAugmentedBFloat16Record>,
+    seq_as_string: bool,
+}
+
+impl Iterator for MultiAugmentedBFloat16DLPackIter {
+    type Item = MultiAugmentedBFloat16Record;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (mut sequence, values, metadata) = self.iter.next()?;
+        if self.seq_as_string {
+            sequence.mapv_inplace(|x| decode_nucleotide(x).unwrap());
+        }
+        Some((sequence, values, metadata))
+    }
+}
+
+#[pymethods]
+impl MultiAugmentedBFloat16DLPackIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        py: Python<'a>,
+    ) -> PyResult<Option<Bound<'a, pyo3::types::PyTuple>>> {
+        let Some((sequence, values, metadata)) = slf.next() else {
+            return Ok(None);
+        };
+
+        let values = values
+            .into_iter()
+            .map(|(tag, value)| Ok((tag, into_dlpack(py, value)?)))
+            .collect::<PyResult<IndexMap<_, _>>>()?;
+        let metadata = metadata.into_pyobject(py)?;
+        let result = if slf.seq_as_string {
+            let sequence = seq_to_string(&sequence);
+            (sequence, values, metadata).into_pyobject(py)?
+        } else {
+            let sequence = PyArray2::from_owned_array(py, sequence);
+            (sequence, values, metadata).into_pyobject(py)?
+        };
+        Ok(Some(result))
     }
 }
 

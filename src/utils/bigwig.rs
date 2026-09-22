@@ -90,11 +90,14 @@ fn save_bw<R: Read + Seek>(
         .collect();
 
     norm_factor = norm_factor.map(|f| {
-        let total: f64 = chromosomes.iter().flat_map(|chrom| {
-            let mut vals = bw.values(&chrom.name, 0, chrom.length).unwrap();
-            fix_nan(&mut vals, Some(0.0));
-            vals.into_iter().map(|x| x as f64)
-        }).sum();
+        let total: f64 = chromosomes
+            .iter()
+            .flat_map(|chrom| {
+                let mut vals = bw.values(&chrom.name, 0, chrom.length).unwrap();
+                fix_nan(&mut vals, Some(0.0));
+                vals.into_iter().map(|x| x as f64)
+            })
+            .sum();
         total / f
     });
 
@@ -117,14 +120,25 @@ fn save_bw<R: Read + Seek>(
             stats.add(x);
         }
         total_size += vals.len() as u64 * 4; // 4 bytes per f32
-        compressed_size += crate::w5z::write_z(&h5, &chrom.name, &vals, &mut zfp, precision, compression_level).unwrap() as u64;
+        compressed_size += crate::w5z::write_z(
+            &h5,
+            &chrom.name,
+            &vals,
+            &mut zfp,
+            precision,
+            compression_level,
+        )
+        .unwrap() as u64;
 
         pb.inc(chrom.length as u64);
     });
 
     stats.write_metadata(h5)?;
 
-    log::info!("Compression ratio: {:.2}%", compressed_size as f64 / total_size as f64 * 100.0);
+    log::info!(
+        "Compression ratio: {:.2}%",
+        compressed_size as f64 / total_size as f64 * 100.0
+    );
     log::info!(
         "Sum: {}, Min: {}, Max: {}, Mean: {}, StdDev: {}",
         stats.sum(),

@@ -1,5 +1,5 @@
-mod bigwig;
 mod bam;
+mod bigwig;
 mod gff;
 
 use pyo3::prelude::*;

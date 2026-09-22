@@ -457,7 +457,7 @@ fn bam_to_bed(record: Record, header: &Header, to_insertion: bool) -> Option<Vec
             Some(vec![BED::<6>::new(
                 &chrom,
                 segment.start,
-                segment.start+1,
+                segment.start + 1,
                 None,
                 None,
                 Some(strand),
@@ -467,7 +467,7 @@ fn bam_to_bed(record: Record, header: &Header, to_insertion: bool) -> Option<Vec
             let segment = spliced_segments.segments.into_iter().last()?;
             Some(vec![BED::<6>::new(
                 &chrom,
-                segment.end-1,
+                segment.end - 1,
                 segment.end,
                 None,
                 None,
@@ -494,4 +494,3 @@ fn bam_to_bed(record: Record, header: &Header, to_insertion: bool) -> Option<Vec
         Some(beds)
     }
 }
- 

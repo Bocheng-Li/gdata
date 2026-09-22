@@ -1,13 +1,15 @@
 use anyhow::{Context, Result};
 use bed_utils::bed::{BEDLike, GenomicRange};
 use indexmap::IndexMap;
+use indicatif::{ProgressIterator, ProgressStyle};
 use itertools::Itertools;
 use noodles::fasta::{
     fai::Index,
     io::{indexed_reader::Builder, IndexedReader},
 };
-use indicatif::{ProgressIterator, ProgressStyle};
+use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use std::collections::{BTreeMap, HashSet};
 use std::io::BufReader;
 use std::path::PathBuf;
@@ -70,15 +72,40 @@ pub struct GenomeDataBuilder {
 
 impl GenomeDataBuilder {
     fn store(&self) -> &DataStoreBuilder {
-        &self.store_builder
+        &self
+            .store_builder
             .as_ref()
-            .expect("data store has been moved").0
+            .expect("data store has been moved")
+            .0
     }
 
     fn store_mut(&mut self) -> &mut DataStoreBuilder {
-        &mut self.store_builder
+        &mut self
+            .store_builder
             .as_mut()
-            .expect("data store has been moved").0
+            .expect("data store has been moved")
+            .0
+    }
+
+    fn create_streaming(
+        location: PathBuf,
+        window_size: u32,
+        resolution: u32,
+        padding: u32,
+        temp_dir: Option<PathBuf>,
+    ) -> Result<Self> {
+        let tmp_dir = if let Some(dir) = temp_dir {
+            tempfile::Builder::new()
+                .prefix("gdata_tmp")
+                .tempdir_in(dir)?
+        } else {
+            tempfile::Builder::new().prefix("gdata_tmp").tempdir()?
+        };
+        let store_builder = DataStoreBuilder::new(&tmp_dir, window_size, resolution, padding)?;
+        Ok(Self {
+            location,
+            store_builder: Some((store_builder, tmp_dir)),
+        })
     }
 }
 
@@ -105,16 +132,13 @@ impl GenomeDataBuilder {
         temp_dir: Option<PathBuf>,
     ) -> Result<Self> {
         let tmp_dir = if let Some(dir) = temp_dir {
-            tempfile::Builder::new().prefix("gdata_tmp").tempdir_in(dir)?
+            tempfile::Builder::new()
+                .prefix("gdata_tmp")
+                .tempdir_in(dir)?
         } else {
             tempfile::Builder::new().prefix("gdata_tmp").tempdir()?
         };
-        let mut store_builder = DataStoreBuilder::new(
-            &tmp_dir,
-            window_size,
-            resolution,
-            padding,
-        )?;
+        let mut store_builder = DataStoreBuilder::new(&tmp_dir, window_size, resolution, padding)?;
         let mut fasta_reader = open_fasta(genome_fasta)?;
 
         // Retrieve chromosome sizes from the FASTA index
@@ -155,6 +179,26 @@ impl GenomeDataBuilder {
             location,
             store_builder: Some((store_builder, tmp_dir)),
         })
+    }
+
+    /// Create a builder for one-pass conversion from already segmented data.
+    ///
+    /// Unlike ``GenomeDataBuilder(...)``, this constructor does not require a
+    /// FASTA file or a complete segment list up front.  Call ``add_segment``
+    /// once per record, then call ``finish``.
+    #[staticmethod]
+    #[pyo3(
+        signature = (location, window_size, *, resolution=1, padding=0, temp_dir=None),
+        text_signature = "(location, window_size, *, resolution=1, padding=0, temp_dir=None)"
+    )]
+    pub fn streaming(
+        location: PathBuf,
+        window_size: u32,
+        resolution: u32,
+        padding: u32,
+        temp_dir: Option<PathBuf>,
+    ) -> Result<Self> {
+        Self::create_streaming(location, window_size, resolution, padding, temp_dir)
     }
 
     /** Returns the keys (track names) in the dataset.
@@ -204,11 +248,14 @@ impl GenomeDataBuilder {
             "Adding files: [{elapsed}] {wide_bar:.cyan/blue} {human_pos}/{human_len} (eta: {eta})",
         )
         .unwrap();
-        files.into_iter().progress_with_style(style).try_for_each(|(key, path)| {
-            py.check_signals()?;
-            self.add_file(&key, path)?;
-            Ok(())
-        })
+        files
+            .into_iter()
+            .progress_with_style(style)
+            .try_for_each(|(key, path)| {
+                py.check_signals()?;
+                self.add_file(&key, path)?;
+                Ok(())
+            })
     }
 
     /** Adds a single file to the dataset.
@@ -232,6 +279,79 @@ impl GenomeDataBuilder {
     pub fn add_file(&mut self, key: &str, path: PathBuf) -> Result<()> {
         let w5z = W5Z::open(path)?;
         self.store_mut().add_w5z(key, w5z)
+    }
+
+    /** Adds already-segmented values directly, without creating a W5Z file.
+
+       Parameters
+       ----------
+       key : str
+           Track name stored in the resulting gdata file.
+       values : numpy.ndarray
+           A float32 array with shape ``(batch_segments, values_per_segment)``.
+           Rows must correspond to consecutive entries in ``segments``.
+       start_index : int
+           Index of the first segment represented by ``values``. The first
+           batch for a track must use 0; subsequent batches must immediately
+           follow the previous batch.
+
+       ``values_per_segment`` is ``(window_size + 2 * padding) / resolution``.
+       This method is intended for streaming conversion: callers can submit a
+       small batch at a time and avoid holding a complete track in memory.
+    */
+    #[pyo3(
+        signature = (key, values, start_index=0),
+        text_signature = "($self, key, values, start_index=0)",
+    )]
+    pub fn add_segment_data(
+        &mut self,
+        key: &str,
+        values: PyReadonlyArray2<'_, f32>,
+        start_index: usize,
+    ) -> Result<()> {
+        self.store_mut()
+            .add_segment_data(key, start_index, values.as_array())
+    }
+
+    /** Add one already-segmented sequence and all track values.
+
+       This method is intended for one-pass TFRecord conversion.  ``segment``
+       must be a unique ``chrom:start-end`` string whose length equals the
+       builder window size.  ``sequence`` is a one-dimensional uint8 array
+       using the encoding A=0, C=1, G=2, T=3, N=4.  ``track_values`` is a
+       dictionary mapping each track name to a contiguous or strided float32
+       vector of ``(window_size + 2 * padding) / resolution`` values.
+
+       The first call fixes the track names and their order.  Every subsequent
+       call must provide exactly the same names in that order and one vector
+       per track.  Data
+       are appended immediately to temporary segment files; no FASTA, W5Z, or
+       second pass over the source records is needed.
+    */
+    #[pyo3(
+        signature = (segment, sequence, track_values),
+        text_signature = "($self, segment, sequence, track_values)"
+    )]
+    pub fn add_segment(
+        &mut self,
+        segment: &str,
+        sequence: PyReadonlyArray1<'_, u8>,
+        track_values: &Bound<'_, PyDict>,
+    ) -> Result<()> {
+        let range = GenomicRange::from_str(segment)
+            .map_err(|error| anyhow::anyhow!("invalid segment range {segment}: {error:?}"))?;
+        let mut arrays = Vec::with_capacity(track_values.len());
+        for (py_key, py_value) in track_values.iter() {
+            let key: String = py_key.extract()?;
+            let values: PyReadonlyArray1<'_, f32> = py_value.extract()?;
+            arrays.push((key, values));
+        }
+        let views = arrays
+            .iter()
+            .map(|(key, values)| (key.clone(), values.as_array()))
+            .collect();
+        self.store_mut()
+            .add_segment(range, sequence.as_array(), views)
     }
 
     /** Finalizes the dataset creation.

@@ -1,9 +1,33 @@
 mod builder;
 mod data_store;
+mod dlpack;
 mod loader;
+mod tfrecord;
 
 pub use builder::GenomeDataBuilder;
-pub use loader::{CatGenomeDataLoader, GenomeDataLoader, GenomeDataLoaderMap};
+pub use loader::{
+    CatGenomeDataLoader, GenomeDataLoader, GenomeDataLoaderAugmentedBFloat16DLPackIter,
+    GenomeDataLoaderBFloat16DLPackIter, GenomeDataLoaderMap, MultiAugmentedBFloat16DLPackIter,
+    MultiBFloat16DLPackIter,
+};
+pub use tfrecord::convert_tfrecord_to_gdata;
+
+/// Reset and enable the low-level gdata reader profiler.
+///
+/// The counters are process-wide and include work performed by the Rust
+/// prefetch threads.  They are intentionally exposed as a small opt-in API
+/// so normal training does not pay for timestamp calls.
+#[pyo3::pyfunction]
+pub fn profile_reset() {
+    data_store::profile_reset();
+}
+
+/// Return accumulated low-level reader timings as
+/// ``[(name, seconds, calls), ...]``.
+#[pyo3::pyfunction]
+pub fn profile_snapshot() -> Vec<(String, f64, u64)> {
+    data_store::profile_snapshot()
+}
 
 #[cfg(test)]
 mod tests {
@@ -109,7 +133,7 @@ mod tests {
             None,
             None,
             resolution,
-            8, 
+            8,
             None,
             None,
         )
@@ -250,7 +274,7 @@ mod tests {
         let mut loader = GenomeDataLoader::new(
             builder.clone(),
             7,
-                None,
+            None,
             None,
             None,
             None,
@@ -273,7 +297,7 @@ mod tests {
             builder.clone(),
             7,
             None,
-                None,
+            None,
             None,
             None,
             Some(16),
@@ -286,17 +310,15 @@ mod tests {
         .unwrap();
         let mut seqs = String::new();
         let mut values = Vec::new();
-        loader
-            .iter()
-            .for_each(|(s, v)| {
-                assert!(
-                    v.shape()[1] == 16,
-                    "Expected 16 channels, got {}",
-                    v.shape()[1]
-                );
-                seqs.extend(seq_to_string(&s));
-                values.extend(v.slice(s![.., .., 1]).to_owned().into_iter());
-            });
+        loader.iter().for_each(|(s, v)| {
+            assert!(
+                v.shape()[1] == 16,
+                "Expected 16 channels, got {}",
+                v.shape()[1]
+            );
+            seqs.extend(seq_to_string(&s));
+            values.extend(v.slice(s![.., .., 1]).to_owned().into_iter());
+        });
         values = values[0..truth.len()].to_vec();
         assert_eq!(values.len(), truth.len());
         assert_almost_equal(&values, &truth, 0.005);
@@ -311,7 +333,7 @@ mod tests {
         let mut loader1 = GenomeDataLoader::new(
             builder.clone(),
             7,
-                None,
+            None,
             Some(24),
             None,
             None,
@@ -331,7 +353,7 @@ mod tests {
         let mut loader2 = GenomeDataLoader::new(
             builder.clone(),
             7,
-                None,
+            None,
             None,
             None,
             None,
@@ -362,7 +384,7 @@ mod tests {
         let mut loader1 = GenomeDataLoader::new(
             builder.clone(),
             7,
-                None,
+            None,
             Some(8),
             None,
             None,
@@ -376,18 +398,16 @@ mod tests {
         .unwrap();
         let mut seqs = String::new();
         let mut values1 = Vec::new();
-        loader1
-            .iter()
-            .for_each(|(s, v)| {
-                seqs.extend(seq_to_string(&s));
-                values1.extend(v.slice(s![.., .., 1]).to_owned().into_iter());
-            });
+        loader1.iter().for_each(|(s, v)| {
+            seqs.extend(seq_to_string(&s));
+            values1.extend(v.slice(s![.., .., 1]).to_owned().into_iter());
+        });
 
         let mut loader2 = GenomeDataLoader::new(
             builder.clone(),
             7,
             None,
-                None,
+            None,
             None,
             None,
             Some(16),
@@ -419,7 +439,7 @@ mod tests {
             let mut loader1 = GenomeDataLoader::new(
                 builder,
                 7,
-                    None,
+                None,
                 Some(8),
                 None,
                 None,
@@ -431,11 +451,9 @@ mod tests {
                 0,
             )
             .unwrap();
-            loader1
-                .iter()
-                .for_each(|(_, v)| {
-                    values1.extend(v.slice(s![..,..,0]).to_owned().into_iter());
-                });
+            loader1.iter().for_each(|(_, v)| {
+                values1.extend(v.slice(s![.., .., 0]).to_owned().into_iter());
+            });
         }
 
         let mut values2 = Vec::new();
@@ -445,7 +463,7 @@ mod tests {
             let mut loader1 = GenomeDataLoader::new(
                 builder,
                 7,
-                    Some(4),
+                Some(4),
                 Some(8),
                 None,
                 None,
@@ -457,15 +475,12 @@ mod tests {
                 0,
             )
             .unwrap();
-            loader1
-                .iter()
-                .for_each(|(_, v)| {
-                    values2.extend(v.slice(s![..,..,0]).to_owned().into_iter());
-                });
+            loader1.iter().for_each(|(_, v)| {
+                values2.extend(v.slice(s![.., .., 0]).to_owned().into_iter());
+            });
         }
         assert_eq!(values1.len(), values2.len());
-        for (v1, v2) in values1.iter().zip(values2.iter())
-        {
+        for (v1, v2) in values1.iter().zip(values2.iter()) {
             assert_eq!(v1, v2, "Values differ: {} != {}", v1, v2);
         }
     }

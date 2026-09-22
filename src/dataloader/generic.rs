@@ -533,7 +533,11 @@ pub(crate) fn decompress_data_zst(buffer: &[u8]) -> Vec<u8> {
 }
 
 /// Split a slice into `n` chunks.
-pub(crate) fn split_n_with_batch_size<T: Clone>(values: &[T], n: usize, batch_size: usize) -> Vec<Vec<T>> {
+pub(crate) fn split_n_with_batch_size<T: Clone>(
+    values: &[T],
+    n: usize,
+    batch_size: usize,
+) -> Vec<Vec<T>> {
     let mut result = vec![Vec::new(); n];
     values.iter().enumerate().for_each(|(mut i, v)| {
         i /= batch_size;
@@ -558,7 +562,10 @@ mod tests {
         assert_eq!(result.len(), n);
 
         let iters = result.into_iter().map(|v| v.into_iter()).collect();
-        assert_eq!(random_values, ParallelLoader::new(iters).collect::<Vec<_>>());
+        assert_eq!(
+            random_values,
+            ParallelLoader::new(iters).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -576,10 +583,17 @@ mod tests {
         let rebatch_iter = ReBatch::new(data.clone().into_iter(), 3);
 
         let arrs = rebatch_iter.map(|(_, target)| target).collect::<Vec<_>>();
-        let arrs = ndarray::concatenate(Axis(0), &arrs.iter().map(|x| x.view()).collect::<Vec<_>>());
+        let arrs =
+            ndarray::concatenate(Axis(0), &arrs.iter().map(|x| x.view()).collect::<Vec<_>>());
 
-        let ground_truth = data.into_iter().map(|(_, target)| target).collect::<Vec<_>>();
-        let ground_truth = ndarray::concatenate(Axis(0), &ground_truth.iter().map(|x| x.view()).collect::<Vec<_>>());
+        let ground_truth = data
+            .into_iter()
+            .map(|(_, target)| target)
+            .collect::<Vec<_>>();
+        let ground_truth = ndarray::concatenate(
+            Axis(0),
+            &ground_truth.iter().map(|x| x.view()).collect::<Vec<_>>(),
+        );
 
         assert_eq!(arrs, ground_truth);
     }

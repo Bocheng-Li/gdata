@@ -17,9 +17,11 @@ pub struct W5Z {
 
 impl W5Z {
     pub fn open(filename: impl AsRef<Path>) -> Result<Self> {
-        Ok(Self { inner: File::open(filename)? })
+        Ok(Self {
+            inner: File::open(filename)?,
+        })
     }
- 
+
     pub fn get(&self, key: &str) -> Result<Array1<f32>> {
         let group = self.inner.group("/")?;
         let dataset = group.dataset(key)?;
@@ -36,8 +38,8 @@ impl W5Z {
             key,
             value,
             &mut Some(false), // zfp is not set yet
-            0.0, // default precision
-            19, // default compression level
+            0.0,              // default precision
+            19,               // default compression level
         )?;
         Ok(())
     }
@@ -66,7 +68,7 @@ impl W5Z {
                     bail!("File already exists: {}", filename.display());
                 }
                 File::create(filename)?
-            },
+            }
             _ => bail!("Invalid mode: {}", mode),
         };
         Ok(Self { inner })
@@ -82,7 +84,11 @@ impl W5Z {
         Ok(keys)
     }
 
-    fn __getitem__<'py>(&'py self, py: Python<'py>, key: &str) -> Result<Bound<'py, PyArray1<f32>>> {
+    fn __getitem__<'py>(
+        &'py self,
+        py: Python<'py>,
+        key: &str,
+    ) -> Result<Bound<'py, PyArray1<f32>>> {
         let arr = self.get(key)?;
         Ok(PyArray1::from_owned_array(py, arr))
     }
@@ -207,14 +213,19 @@ impl Statistics {
     }
 }
 
-
-
 pub struct Codec {
     pub zfp: Option<f64>,
     pub zstd_src_size: u64,
 }
 
-pub fn write_z(h5: &Group, name: &str, data: &[f32], zfp: &mut Option<bool>, precision: f64, compression_level: u8) -> Result<usize> {
+pub fn write_z(
+    h5: &Group,
+    name: &str,
+    data: &[f32],
+    zfp: &mut Option<bool>,
+    precision: f64,
+    compression_level: u8,
+) -> Result<usize> {
     let (codec, data) = encode_z(data, zfp.clone(), precision, compression_level).unwrap();
     h5.new_dataset::<u8>()
         .shape([data.len()])
@@ -248,17 +259,22 @@ pub fn write_z(h5: &Group, name: &str, data: &[f32], zfp: &mut Option<bool>, pre
             .write_scalar(&codec.zfp.unwrap())?;
     }
 
-    // Update zfp 
+    // Update zfp
     if zfp.is_none() {
         log::info!("Using ZFP compression: {}", use_zfp);
         *zfp = Some(use_zfp);
     }
-        
+
     Ok(data.len())
 }
 
 /// Encode the data using ZFP compression with a specified precision.
-pub fn encode_z(data: &[f32], zfp: Option<bool>, tolerance: f64, compression_level: u8) -> Result<(Codec, Vec<u8>)> {
+pub fn encode_z(
+    data: &[f32],
+    zfp: Option<bool>,
+    tolerance: f64,
+    compression_level: u8,
+) -> Result<(Codec, Vec<u8>)> {
     match zfp {
         Some(true) => enc_both(data, tolerance, compression_level),
         Some(false) => enc_zstd(data, compression_level),
@@ -284,7 +300,9 @@ pub fn decode_z(data: &Array1<u8>, zfp: bool, size: usize) -> Result<Array1<f32>
             .to_owned()
             .into_dimensionality()?
     } else {
-        Array1::from_vec(bincode::decode_from_slice::<_, Configuration>(&data, Configuration::default())?.0)
+        Array1::from_vec(
+            bincode::decode_from_slice::<_, Configuration>(&data, Configuration::default())?.0,
+        )
     };
     Ok(decoded)
 }

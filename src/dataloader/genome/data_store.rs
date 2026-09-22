@@ -5,7 +5,7 @@ use half::bf16;
 use indexmap::{IndexMap, IndexSet};
 use indicatif::{ProgressBar, ProgressStyle};
 use itertools::Itertools;
-use ndarray::{s, Array1, Array2, Array3, ArrayView2, ArrayView3, ArrayViewMut3, Axis};
+use ndarray::{s, Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, ArrayViewMut3, Axis};
 use noodles::core::Position;
 use noodles::fasta::io::IndexedReader;
 use rand::seq::SliceRandom;
@@ -19,12 +19,177 @@ use std::io::{Read, Seek, Write};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::dataloader::generic::{split_n_with_batch_size, ParallelLoader, ReBatch};
 use crate::w5z::W5Z;
 
 use super::super::generic::{compress_data_zst, decompress_data_zst};
+
+static PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
+static PROFILE_METADATA_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_METADATA_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_FILE_READ_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_FILE_READ_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_ZSTD_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_ZSTD_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_BINCODE_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_BINCODE_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_POSTPROCESS_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_POSTPROCESS_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_VALUE_CONVERT_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_VALUE_CONVERT_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_SEQ_SHAPE_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_SEQ_SHAPE_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_VALUES_TRANSPOSE_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_VALUES_TRANSPOSE_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_SEQ_CROP_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_SEQ_CROP_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_VALUES_CROP_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_VALUES_CROP_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_AGGREGATE_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_AGGREGATE_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_SPLIT_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_SPLIT_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_TRIM_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_TRIM_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_TRANSFORM_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_TRANSFORM_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_FINAL_SEQ_LAYOUT_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_FINAL_SEQ_LAYOUT_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_FINAL_VALUES_LAYOUT_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_FINAL_VALUES_LAYOUT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn profile_start() -> Option<Instant> {
+    PROFILE_ENABLED.load(Ordering::Relaxed).then(Instant::now)
+}
+
+fn profile_record(total: &AtomicU64, count: &AtomicU64, start: Option<Instant>) {
+    if let Some(start) = start {
+        total.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn profile_reset() {
+    PROFILE_METADATA_NS.store(0, Ordering::Relaxed);
+    PROFILE_METADATA_COUNT.store(0, Ordering::Relaxed);
+    PROFILE_FILE_READ_NS.store(0, Ordering::Relaxed);
+    PROFILE_FILE_READ_COUNT.store(0, Ordering::Relaxed);
+    PROFILE_ZSTD_NS.store(0, Ordering::Relaxed);
+    PROFILE_ZSTD_COUNT.store(0, Ordering::Relaxed);
+    PROFILE_BINCODE_NS.store(0, Ordering::Relaxed);
+    PROFILE_BINCODE_COUNT.store(0, Ordering::Relaxed);
+    PROFILE_POSTPROCESS_NS.store(0, Ordering::Relaxed);
+    PROFILE_POSTPROCESS_COUNT.store(0, Ordering::Relaxed);
+    PROFILE_VALUE_CONVERT_NS.store(0, Ordering::Relaxed);
+    PROFILE_VALUE_CONVERT_COUNT.store(0, Ordering::Relaxed);
+    PROFILE_SEQ_SHAPE_NS.store(0, Ordering::Relaxed);
+    PROFILE_SEQ_SHAPE_COUNT.store(0, Ordering::Relaxed);
+    PROFILE_VALUES_TRANSPOSE_NS.store(0, Ordering::Relaxed);
+    PROFILE_VALUES_TRANSPOSE_COUNT.store(0, Ordering::Relaxed);
+    PROFILE_SEQ_CROP_NS.store(0, Ordering::Relaxed);
+    PROFILE_SEQ_CROP_COUNT.store(0, Ordering::Relaxed);
+    PROFILE_VALUES_CROP_NS.store(0, Ordering::Relaxed);
+    PROFILE_VALUES_CROP_COUNT.store(0, Ordering::Relaxed);
+    PROFILE_AGGREGATE_NS.store(0, Ordering::Relaxed);
+    PROFILE_AGGREGATE_COUNT.store(0, Ordering::Relaxed);
+    PROFILE_SPLIT_NS.store(0, Ordering::Relaxed);
+    PROFILE_SPLIT_COUNT.store(0, Ordering::Relaxed);
+    PROFILE_TRIM_NS.store(0, Ordering::Relaxed);
+    PROFILE_TRIM_COUNT.store(0, Ordering::Relaxed);
+    PROFILE_TRANSFORM_NS.store(0, Ordering::Relaxed);
+    PROFILE_TRANSFORM_COUNT.store(0, Ordering::Relaxed);
+    PROFILE_FINAL_SEQ_LAYOUT_NS.store(0, Ordering::Relaxed);
+    PROFILE_FINAL_SEQ_LAYOUT_COUNT.store(0, Ordering::Relaxed);
+    PROFILE_FINAL_VALUES_LAYOUT_NS.store(0, Ordering::Relaxed);
+    PROFILE_FINAL_VALUES_LAYOUT_COUNT.store(0, Ordering::Relaxed);
+    PROFILE_ENABLED.store(true, Ordering::Relaxed);
+}
+
+pub(crate) fn profile_snapshot() -> Vec<(String, f64, u64)> {
+    [
+        (
+            "metadata_read_s",
+            &PROFILE_METADATA_NS,
+            &PROFILE_METADATA_COUNT,
+        ),
+        (
+            "file_read_s",
+            &PROFILE_FILE_READ_NS,
+            &PROFILE_FILE_READ_COUNT,
+        ),
+        ("zstd_decompress_s", &PROFILE_ZSTD_NS, &PROFILE_ZSTD_COUNT),
+        (
+            "bincode_decode_s",
+            &PROFILE_BINCODE_NS,
+            &PROFILE_BINCODE_COUNT,
+        ),
+        (
+            "rust_postprocess_s",
+            &PROFILE_POSTPROCESS_NS,
+            &PROFILE_POSTPROCESS_COUNT,
+        ),
+        (
+            "rust_bf16_to_f32_s",
+            &PROFILE_VALUE_CONVERT_NS,
+            &PROFILE_VALUE_CONVERT_COUNT,
+        ),
+        (
+            "rust_seq_shape_s",
+            &PROFILE_SEQ_SHAPE_NS,
+            &PROFILE_SEQ_SHAPE_COUNT,
+        ),
+        (
+            "rust_values_transpose_s",
+            &PROFILE_VALUES_TRANSPOSE_NS,
+            &PROFILE_VALUES_TRANSPOSE_COUNT,
+        ),
+        (
+            "rust_seq_crop_s",
+            &PROFILE_SEQ_CROP_NS,
+            &PROFILE_SEQ_CROP_COUNT,
+        ),
+        (
+            "rust_values_crop_copy_s",
+            &PROFILE_VALUES_CROP_NS,
+            &PROFILE_VALUES_CROP_COUNT,
+        ),
+        (
+            "rust_aggregation_s",
+            &PROFILE_AGGREGATE_NS,
+            &PROFILE_AGGREGATE_COUNT,
+        ),
+        ("rust_split_s", &PROFILE_SPLIT_NS, &PROFILE_SPLIT_COUNT),
+        ("rust_trim_s", &PROFILE_TRIM_NS, &PROFILE_TRIM_COUNT),
+        (
+            "rust_transform_s",
+            &PROFILE_TRANSFORM_NS,
+            &PROFILE_TRANSFORM_COUNT,
+        ),
+        (
+            "rust_final_seq_layout_s",
+            &PROFILE_FINAL_SEQ_LAYOUT_NS,
+            &PROFILE_FINAL_SEQ_LAYOUT_COUNT,
+        ),
+        (
+            "rust_final_values_layout_s",
+            &PROFILE_FINAL_VALUES_LAYOUT_NS,
+            &PROFILE_FINAL_VALUES_LAYOUT_COUNT,
+        ),
+    ]
+    .into_iter()
+    .map(|(name, total, count)| {
+        (
+            name.to_string(),
+            total.load(Ordering::Relaxed) as f64 / 1e9,
+            count.load(Ordering::Relaxed),
+        )
+    })
+    .collect()
+}
 
 /// Dimension: (sequence, experiment)
 #[derive(Debug, Clone, PartialEq)]
@@ -32,7 +197,11 @@ pub struct Values(Array3<bf16>);
 
 impl From<Array3<bf16>> for Values {
     fn from(arr: Array3<bf16>) -> Self {
-        Values(arr.as_standard_layout().to_owned())
+        // `read_bf16` already returns a standard-layout owned array.  Taking
+        // ownership here is important: calling `as_standard_layout()` on an
+        // owned array through a view would make a second, very large copy of
+        // every parent record.
+        Values(arr)
     }
 }
 
@@ -152,7 +321,13 @@ pub struct DataStore {
 impl DataStore {
     pub fn open(path: impl AsRef<Path>, mut read_opts: DataStoreReadOptions) -> Result<Self> {
         let mut file = File::open(&path).context("Failed to open data store file")?;
+        let metadata_start = profile_start();
         let metadata = read_metadata(&mut file)?;
+        profile_record(
+            &PROFILE_METADATA_NS,
+            &PROFILE_METADATA_COUNT,
+            metadata_start,
+        );
 
         ensure!(
             read_opts.shift_width <= metadata.padding,
@@ -166,7 +341,14 @@ impl DataStore {
                 read_resolution % metadata.resolution == 0,
                 "Read resolution must be a multiple of resolution"
             );
-            aggregate_size = Some(read_resolution / metadata.resolution);
+            let aggregation_factor = read_resolution / metadata.resolution;
+            // Requesting the resolution at which the data is already stored
+            // is an identity operation.  In particular, avoid routing
+            // factor=1 through `aggregate_by_length`, which would otherwise
+            // perform a full bf16 -> f64 -> mean -> bf16 pass over the array.
+            if aggregation_factor > 1 {
+                aggregate_size = Some(aggregation_factor);
+            }
             out_resolution = read_resolution;
         }
 
@@ -230,6 +412,13 @@ impl DataStore {
         self.inner.metadata.resolution
     }
 
+    /// Whether the requested reader resolution requires an aggregation pass.
+    /// The native center/split path needs the stored resolution so that its
+    /// base-pair crop can be shared exactly across modalities.
+    pub(crate) fn has_aggregation(&self) -> bool {
+        self.aggregate_size.is_some()
+    }
+
     pub fn set_value_length(&mut self, value_length: u32) -> Result<()> {
         ensure!(
             value_length % self.out_resolution == 0,
@@ -258,24 +447,64 @@ impl DataStore {
         Ok(())
     }
 
-    pub fn read(&mut self, region: &GenomicRange) -> Option<(Sequence, Values)> {
+    /// Read a region and keep the values in their on-disk bfloat16 type.
+    ///
+    /// The historical/default layout is `(batch, sequence, track)`.
+    ///
+    /// The returned array owns its allocation and is standard-layout with
+    /// shape `(batch, sequence, track)`.  This is the zero-copy hand-off point
+    /// used by the DLPack iterator.  In particular, do not turn this array
+    /// into a view and then call `as_standard_layout().to_owned()` again: for
+    /// the AlphaGenome-sized records that would copy hundreds of MiB per
+    /// parent.
+    pub fn read_bf16(&mut self, region: &GenomicRange) -> Option<(Sequence, Array3<bf16>)> {
+        self.read_bf16_with_layout(region, true)
+    }
+
+    /// Read a region while choosing the returned values layout.
+    ///
+    /// `channels_last=true` returns `(batch, sequence, track)` and preserves
+    /// the historical gdata/DLPack API.  `channels_last=false` returns
+    /// `(batch, track, sequence)`.  The latter matches Conv1d-based model
+    /// heads and can reuse the decoded on-disk `(track, sequence)` allocation
+    /// directly when no sequence crop/aggregation/trim is requested.
+    pub fn read_bf16_with_layout(
+        &mut self,
+        region: &GenomicRange,
+        channels_last: bool,
+    ) -> Option<(Sequence, Array3<bf16>)> {
         let offset = self.inner.metadata.segment_index.get(region)?;
         let mut buffer = vec![0; offset.0 .1 as usize];
+        let file_read_start = profile_start();
         self.inner
             .file
             .read_exact_at(&mut buffer, offset.0 .0 as u64)
             .expect("read failed");
+        profile_record(
+            &PROFILE_FILE_READ_NS,
+            &PROFILE_FILE_READ_COUNT,
+            file_read_start,
+        );
 
         // Deserialize the sequence and values
+        let zstd_start = profile_start();
         let buffer = decompress_data_zst(&buffer);
+        profile_record(&PROFILE_ZSTD_NS, &PROFILE_ZSTD_COUNT, zstd_start);
+        let bincode_start = profile_start();
         let (seq, arr): (Vec<u8>, Array2<bf16>) =
             bincode::serde::decode_from_slice(&buffer, bincode::config::standard())
                 .expect("decode failed")
                 .0;
-        let seq = Array1::from_vec(seq).insert_axis(Axis(0));
-        // arr need to be transposed to match the expected shape (sequence, experiment)
-        let arr = arr.t().insert_axis(Axis(0));
+        profile_record(&PROFILE_BINCODE_NS, &PROFILE_BINCODE_COUNT, bincode_start);
 
+        let postprocess_start = profile_start();
+        let seq_shape_start = profile_start();
+        let seq = Array1::from_vec(seq).insert_axis(Axis(0));
+        profile_record(
+            &PROFILE_SEQ_SHAPE_NS,
+            &PROFILE_SEQ_SHAPE_COUNT,
+            seq_shape_start,
+        );
         // Apply random shifting
         let mut shift = self.read_opts.shift_width as i32;
         let res = self.resolution();
@@ -286,34 +515,216 @@ impl DataStore {
         let seq_end = seq_start + self.sequence_length() as usize;
         let arr_start = seq_start / res as usize;
         let arr_end = seq_end / res as usize;
+        let seq_crop_start = profile_start();
         let mut seq = seq.slice(s![.., seq_start..seq_end]);
-        let mut arr = arr.slice(s![.., arr_start..arr_end, ..]).to_owned();
+        profile_record(
+            &PROFILE_SEQ_CROP_NS,
+            &PROFILE_SEQ_CROP_COUNT,
+            seq_crop_start,
+        );
+
+        let (n_tracks, n_values) = arr.dim();
+        let values_crop_start = profile_start();
+        // The decoded on-disk array is contiguous `(track, sequence)`.
+        //
+        // In channels-last mode we must transpose and materialise a new
+        // `(batch, sequence, track)` array.  In channels-first mode we can
+        // reshape the owned allocation to `(batch, track, sequence)` without
+        // copying.  When the requested range is the complete parent, retain
+        // that allocation instead of doing a full values copy.
+        let mut arr = if channels_last {
+            let values_transpose_start = profile_start();
+            let arr_view = arr.view();
+            let transposed = arr_view.t().insert_axis(Axis(0));
+            profile_record(
+                &PROFILE_VALUES_TRANSPOSE_NS,
+                &PROFILE_VALUES_TRANSPOSE_COUNT,
+                values_transpose_start,
+            );
+            transposed
+                .slice(s![.., arr_start..arr_end, ..])
+                .as_standard_layout()
+                .to_owned()
+        } else {
+            let mut arr = arr
+                .into_shape_with_order((1, n_tracks, n_values))
+                .expect("decoded values must be contiguous");
+            if arr_start != 0 || arr_end != n_values {
+                arr = arr.slice(s![.., .., arr_start..arr_end]).to_owned();
+            }
+            arr
+        };
+        profile_record(
+            &PROFILE_VALUES_CROP_NS,
+            &PROFILE_VALUES_CROP_COUNT,
+            values_crop_start,
+        );
 
         // Apply value aggregation
         if let Some(agg) = self.aggregate_size {
-            arr = aggregate_by_length(arr, agg as usize);
+            let aggregate_start = profile_start();
+            arr = aggregate_by_length_layout(arr, agg as usize, channels_last);
+            profile_record(
+                &PROFILE_AGGREGATE_NS,
+                &PROFILE_AGGREGATE_COUNT,
+                aggregate_start,
+            );
         }
 
         // Apply splitting
         if let Some(split) = self.read_opts.split_size {
+            let split_start = profile_start();
             seq = split_sequence(seq, split as usize).unwrap();
-            arr = split_data(arr, (split / self.out_resolution) as usize).unwrap()
+            arr = split_data_layout(arr, (split / self.out_resolution) as usize, channels_last)
+                .unwrap();
+            profile_record(&PROFILE_SPLIT_NS, &PROFILE_SPLIT_COUNT, split_start);
         }
 
-        // Trim the output values
+        // Trim the output values.  Keep an owned array whenever the requested
+        // range is the complete array.  The previous implementation always
+        // created a mutable slice and then copied that view into `Values`,
+        // even when no trimming was requested.
+        let trim_start_time = profile_start();
         let v_len = self.read_opts.value_length.unwrap_or(self.output_length());
         let trim_start = (self.output_length() - v_len) / self.out_resolution / 2;
         let trim_end = trim_start + (v_len / self.out_resolution);
-        let mut arr = arr.slice_mut(s![.., trim_start as usize..trim_end as usize, ..]);
+        let arr_len = if channels_last {
+            arr.shape()[1]
+        } else {
+            arr.shape()[2]
+        };
+        let trim_start = trim_start as usize;
+        let trim_end = trim_end as usize;
+        let mut arr = if trim_start == 0 && trim_end == arr_len {
+            arr
+        } else if channels_last {
+            arr.slice(s![.., trim_start..trim_end, ..])
+                .as_standard_layout()
+                .to_owned()
+        } else {
+            arr.slice(s![.., .., trim_start..trim_end]).to_owned()
+        };
+        profile_record(&PROFILE_TRIM_NS, &PROFILE_TRIM_COUNT, trim_start_time);
 
-        // Aplly scaling and clamping
-        transform(
-            arr.view_mut(),
-            self.read_opts.scale_value,
-            self.read_opts.clamp_value_max,
+        // Scaling, clamping, and NaN replacement are one optional transform
+        // pass.  Do not scan every value when neither scale nor clamp was
+        // requested.  NaN replacement is intentionally part of this same
+        // opt-in path rather than an unconditional default operation.
+        if self.read_opts.scale_value.is_some() || self.read_opts.clamp_value_max.is_some() {
+            let transform_start = profile_start();
+            transform(
+                arr.view_mut(),
+                self.read_opts.scale_value,
+                self.read_opts.clamp_value_max,
+            );
+            profile_record(
+                &PROFILE_TRANSFORM_NS,
+                &PROFILE_TRANSFORM_COUNT,
+                transform_start,
+            );
+        }
+
+        profile_record(
+            &PROFILE_POSTPROCESS_NS,
+            &PROFILE_POSTPROCESS_COUNT,
+            postprocess_start,
         );
 
-        Some((seq.into(), arr.view().into()))
+        let seq_layout_start = profile_start();
+        let seq: Sequence = seq.into();
+        profile_record(
+            &PROFILE_FINAL_SEQ_LAYOUT_NS,
+            &PROFILE_FINAL_SEQ_LAYOUT_COUNT,
+            seq_layout_start,
+        );
+        // The native-resolution training path is already an owned
+        // standard-layout Array3, so this is only a move.  Keep a defensive
+        // fallback for less common aggregation/splitting combinations; it
+        // also preserves the layout guarantee required by ReBatch/DLPack.
+        let values_layout_start = profile_start();
+        let values = if arr.is_standard_layout() {
+            arr
+        } else {
+            arr.as_standard_layout().to_owned()
+        };
+        profile_record(
+            &PROFILE_FINAL_VALUES_LAYOUT_NS,
+            &PROFILE_FINAL_VALUES_LAYOUT_COUNT,
+            values_layout_start,
+        );
+
+        Some((seq, values))
+    }
+
+    /// Read the complete physical parent record without applying the normal
+    /// loader windowing options.
+    ///
+    /// The ordinary reader intentionally returns the logical window described
+    /// by the metadata (and removes the metadata padding first).  Native
+    /// center/split augmentation has a different contract: it needs the
+    /// complete record so that it can determine the available flank itself.
+    /// In particular this is what makes a record written with
+    /// ``padding=0`` but with a larger parent length usable for augmentation.
+    /// The caller is responsible for validating that no aggregation, trim,
+    /// split, scale, or random-shift options are active.
+    pub fn read_parent_bf16_with_layout(
+        &mut self,
+        region: &GenomicRange,
+        channels_last: bool,
+    ) -> Option<(Sequence, Array3<bf16>)> {
+        let offset = self.inner.metadata.segment_index.get(region)?;
+        let mut buffer = vec![0; offset.0 .1 as usize];
+        let file_read_start = profile_start();
+        self.inner
+            .file
+            .read_exact_at(&mut buffer, offset.0 .0 as u64)
+            .expect("read failed");
+        profile_record(
+            &PROFILE_FILE_READ_NS,
+            &PROFILE_FILE_READ_COUNT,
+            file_read_start,
+        );
+
+        let zstd_start = profile_start();
+        let buffer = decompress_data_zst(&buffer);
+        profile_record(&PROFILE_ZSTD_NS, &PROFILE_ZSTD_COUNT, zstd_start);
+
+        let bincode_start = profile_start();
+        let (seq, arr): (Vec<u8>, Array2<bf16>) =
+            bincode::serde::decode_from_slice(&buffer, bincode::config::standard())
+                .expect("decode failed")
+                .0;
+        profile_record(&PROFILE_BINCODE_NS, &PROFILE_BINCODE_COUNT, bincode_start);
+
+        let sequence = Array2::from_shape_vec((1, seq.len()), seq)
+            .expect("decoded sequence must be one-dimensional");
+        let (n_tracks, n_values) = arr.dim();
+        let values = if channels_last {
+            arr.view()
+                .t()
+                .insert_axis(Axis(0))
+                .as_standard_layout()
+                .to_owned()
+        } else {
+            arr.into_shape_with_order((1, n_tracks, n_values))
+                .expect("decoded values must be contiguous")
+        };
+        Some((Sequence(sequence), values))
+    }
+
+    /// Backwards-compatible bfloat16 wrapper used by the existing Rust API.
+    pub fn read(&mut self, region: &GenomicRange) -> Option<(Sequence, Values)> {
+        let (seq, values) = self.read_bf16(region)?;
+        Some((seq, Values::from(values)))
+    }
+
+    /// Layout-selectable counterpart to [`DataStore::read`].
+    pub fn read_with_layout(
+        &mut self,
+        region: &GenomicRange,
+        channels_last: bool,
+    ) -> Option<(Sequence, Array3<bf16>)> {
+        self.read_bf16_with_layout(region, channels_last)
     }
 
     pub fn read_at(&mut self, i: usize) -> Option<(Sequence, Values)> {
@@ -358,6 +769,112 @@ impl DataStore {
             .collect::<Vec<_>>();
         ParallelLoader::new(iters)
     }
+
+    /// Parallel iterator which preserves the stored bfloat16 values.
+    ///
+    /// This mirrors [`DataStore::par_iter`] but deliberately does not perform
+    /// the bfloat16-to-float32 conversion.  The Python-facing loader exposes
+    /// this path through a DLPack capsule so PyTorch can consume the owned
+    /// buffer directly.
+    pub fn par_iter_bf16(
+        &mut self,
+        batch_size: usize,
+        num_threads: usize,
+        shuffle: bool,
+        subset: Option<&[GenomicRange]>,
+    ) -> impl Iterator<Item = (Array2<u8>, Array3<bf16>)> {
+        self.par_iter_bf16_with_layout(batch_size, num_threads, shuffle, subset, true)
+    }
+
+    /// Layout-selectable native-bfloat16 iterator.
+    pub fn par_iter_bf16_with_layout(
+        &mut self,
+        batch_size: usize,
+        num_threads: usize,
+        shuffle: bool,
+        subset: Option<&[GenomicRange]>,
+        channels_last: bool,
+    ) -> impl Iterator<Item = (Array2<u8>, Array3<bf16>)> {
+        let mut segments = if let Some(s) = subset {
+            assert!(
+                s.iter()
+                    .all(|r| self.inner.metadata.segment_index.contains_key(r)),
+                "Some segments in the subset do not exist in the data store"
+            );
+            s.to_vec()
+        } else {
+            self.inner
+                .metadata
+                .segment_index
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        if shuffle {
+            segments.shuffle(&mut self.read_opts.rng);
+        }
+        let iters = split_n_with_batch_size(&segments, num_threads, batch_size)
+            .into_iter()
+            .map(|chunk| {
+                let iter = DataStoreBf16Iter {
+                    segments: chunk.into(),
+                    store: self.clone(),
+                    channels_last,
+                };
+                ReBatch::new(iter, batch_size)
+            })
+            .collect::<Vec<_>>();
+        ParallelLoader::new(iters)
+    }
+
+    /// Iterate over native-bfloat16 records while retaining the genomic range
+    /// that produced each record.
+    ///
+    /// This is the low-level iterator used by the runtime center-crop/split
+    /// augmentation path.  `regions` is already ordered by the caller; the
+    /// method deliberately does not shuffle it so that multiple synchronized
+    /// loaders can consume exactly the same parent order.
+    pub fn par_iter_bf16_with_layout_and_regions(
+        &mut self,
+        regions: Vec<GenomicRange>,
+        num_threads: usize,
+        channels_last: bool,
+    ) -> ParallelLoader<DataStoreBf16RegionIter, (GenomicRange, Array2<u8>, Array3<bf16>)> {
+        let num_threads = num_threads.max(1);
+        let iters = split_n_with_batch_size(&regions, num_threads, 1)
+            .into_iter()
+            .map(|chunk| DataStoreBf16RegionIter {
+                segments: chunk.into(),
+                store: self.clone(),
+                channels_last,
+            })
+            .collect::<Vec<_>>();
+        ParallelLoader::new(iters)
+    }
+
+    /// Region-preserving iterator over complete physical parent records.
+    ///
+    /// This is intentionally separate from the regular region iterator: the
+    /// latter applies the logical window crop and is therefore not suitable
+    /// for runtime center/shift augmentation.
+    pub fn par_iter_bf16_parent_with_layout_and_regions(
+        &mut self,
+        regions: Vec<GenomicRange>,
+        num_threads: usize,
+        channels_last: bool,
+    ) -> ParallelLoader<DataStoreBf16ParentRegionIter, (GenomicRange, u64, Array2<u8>, Array3<bf16>)>
+    {
+        let num_threads = num_threads.max(1);
+        let iters = split_n_with_batch_size(&regions, num_threads, 1)
+            .into_iter()
+            .map(|chunk| DataStoreBf16ParentRegionIter {
+                segments: chunk.into(),
+                store: self.clone(),
+                channels_last,
+            })
+            .collect::<Vec<_>>();
+        ParallelLoader::new(iters)
+    }
 }
 
 pub struct DataStoreIter {
@@ -370,13 +887,115 @@ impl Iterator for DataStoreIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         let segment = self.segments.pop_front()?;
-        let (seq, values) = self.store.read(&segment).unwrap();
-        Some((seq.into(), values.into()))
+        let (seq, values) = self.store.read_bf16(&segment).unwrap();
+        let value_convert_start = profile_start();
+        let values: Array3<f32> = values.mapv(|x| x.to_f32());
+        profile_record(
+            &PROFILE_VALUE_CONVERT_NS,
+            &PROFILE_VALUE_CONVERT_COUNT,
+            value_convert_start,
+        );
+        Some((seq.into(), values))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         let len = self.segments.len();
         (len, Some(len))
+    }
+}
+
+/// The native bfloat16 counterpart of [`DataStoreIter`].
+pub struct DataStoreBf16Iter {
+    segments: VecDeque<GenomicRange>,
+    store: DataStore,
+    channels_last: bool,
+}
+
+impl Iterator for DataStoreBf16Iter {
+    type Item = (Array2<u8>, Array3<bf16>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let segment = self.segments.pop_front()?;
+        let (seq, values) = self
+            .store
+            .read_bf16_with_layout(&segment, self.channels_last)
+            .unwrap();
+        Some((seq.into(), values))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.segments.len();
+        (len, Some(len))
+    }
+}
+
+impl ExactSizeIterator for DataStoreBf16Iter {
+    fn len(&self) -> usize {
+        self.segments.len()
+    }
+}
+
+/// Region-preserving counterpart to [`DataStoreBf16Iter`].
+///
+/// The regular iterator intentionally exposes only arrays for backwards
+/// compatibility.  The native augmentation iterator needs the parent genomic
+/// range in order to report the updated `chr:start-end` coordinates after a
+/// center crop and split.
+pub struct DataStoreBf16RegionIter {
+    segments: VecDeque<GenomicRange>,
+    store: DataStore,
+    channels_last: bool,
+}
+
+impl Iterator for DataStoreBf16RegionIter {
+    type Item = (GenomicRange, Array2<u8>, Array3<bf16>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let segment = self.segments.pop_front()?;
+        let (seq, values) = self
+            .store
+            .read_bf16_with_layout(&segment, self.channels_last)?;
+        Some((segment, seq.into(), values))
+    }
+}
+
+impl ExactSizeIterator for DataStoreBf16RegionIter {
+    fn len(&self) -> usize {
+        self.segments.len()
+    }
+}
+
+/// Region-preserving iterator over complete physical parent records.
+///
+/// Unlike `DataStoreBf16RegionIter`, this intentionally bypasses the logical
+/// window crop so the native center/split path can use both metadata padding
+/// and any extra parent length when calculating a shift.
+pub struct DataStoreBf16ParentRegionIter {
+    segments: VecDeque<GenomicRange>,
+    store: DataStore,
+    channels_last: bool,
+}
+
+impl Iterator for DataStoreBf16ParentRegionIter {
+    type Item = (GenomicRange, u64, Array2<u8>, Array3<bf16>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let segment = self.segments.pop_front()?;
+        let (seq, values) = self
+            .store
+            .read_parent_bf16_with_layout(&segment, self.channels_last)?;
+        // The metadata range denotes the logical (unpadded) interval.  The
+        // first base of the physical parent therefore starts at this origin.
+        // `saturating_sub` handles chromosome-start records whose left flank
+        // is represented by N bases outside the chromosome.
+        let physical_start = segment.start().saturating_sub(self.store.n_pad() as u64);
+        Some((segment, physical_start, seq.into(), values))
+    }
+}
+
+impl ExactSizeIterator for DataStoreBf16ParentRegionIter {
+    fn len(&self) -> usize {
+        self.segments.len()
     }
 }
 
@@ -394,6 +1013,10 @@ pub struct DataStoreBuilder {
     padding: u32,
     pub(crate) segments: IndexMap<GenomicRange, PathBuf>,
     pub(crate) data_keys: IndexSet<String>,
+    // Number of segment value blocks written for each direct (non-W5Z) track.
+    // This lets Python callers stream batches while finish() verifies that
+    // every segment has a value block for every track.
+    value_counts: HashMap<String, usize>,
 }
 
 impl DataStoreBuilder {
@@ -421,6 +1044,7 @@ impl DataStoreBuilder {
             location: location.as_ref().to_path_buf(),
             segments: IndexMap::new(),
             data_keys: IndexSet::new(),
+            value_counts: HashMap::new(),
             sequence_length,
             resolution,
             padding,
@@ -495,16 +1119,215 @@ impl DataStoreBuilder {
         self.add_seqs(seqs)
     }
 
+    /// Append one sequence and all of its track values in a single pass.
+    ///
+    /// This is the streaming counterpart to `add_segments` + `add_values`:
+    /// the caller supplies an already encoded sequence (A=0, C=1, G=2, T=3,
+    /// N=4) and one float32 vector for every track.  The first segment fixes
+    /// the track names and their order; every subsequent segment must provide
+    /// exactly the same names in that order.  Data are written to the per-segment
+    /// temporary file immediately, so no FASTA file or second TFRecord pass is
+    /// required.
+    pub fn add_segment(
+        &mut self,
+        range: GenomicRange,
+        sequence: ArrayView1<'_, u8>,
+        track_values: Vec<(String, ArrayView1<'_, f32>)>,
+    ) -> Result<()> {
+        let owned_values: Vec<(String, Vec<bf16>)> = track_values
+            .into_iter()
+            .map(|(key, values)| {
+                (
+                    key,
+                    values.iter().map(|value| bf16::from_f32(*value)).collect(),
+                )
+            })
+            .collect();
+        self.add_segment_bf16(
+            range,
+            sequence,
+            owned_values
+                .iter()
+                .map(|(key, values)| (key.clone(), values.as_slice()))
+                .collect(),
+        )
+    }
+
+    /// Append one sequence and already-decoded bfloat16 track values.
+    ///
+    /// This is kept as a Rust-level API so native TFRecord conversion can
+    /// decode bfloat16 tensors without first materializing a float32 copy of
+    /// every track.  The slices are copied/compressed before this method
+    /// returns, so callers may reuse their buffers afterwards.
+    pub(crate) fn add_segment_bf16(
+        &mut self,
+        range: GenomicRange,
+        sequence: ArrayView1<'_, u8>,
+        track_values: Vec<(String, &[bf16])>,
+    ) -> Result<()> {
+        let expected_sequence = self.total_sequence_length() as usize;
+        ensure!(
+            sequence.len() == expected_sequence,
+            "sequence for {} has length {}, expected {}",
+            range.pretty_show(),
+            sequence.len(),
+            expected_sequence
+        );
+        ensure!(!track_values.is_empty(), "at least one track is required");
+        ensure!(
+            !self.segments.contains_key(&range),
+            "segment {} already exists",
+            range.pretty_show()
+        );
+
+        for (key, values) in &track_values {
+            ensure!(!key.is_empty(), "track name must not be empty");
+            ensure!(
+                values.len() == (self.total_sequence_length() / self.resolution) as usize,
+                "track {} has {} values, expected {}",
+                key,
+                values.len(),
+                self.total_sequence_length() / self.resolution
+            );
+        }
+
+        if self.data_keys.is_empty() {
+            for (key, _) in &track_values {
+                ensure!(
+                    !self.data_keys.contains(key),
+                    "track {} was supplied more than once",
+                    key
+                );
+                self.data_keys.insert(key.clone());
+                self.value_counts.insert(key.clone(), 0);
+            }
+        } else {
+            ensure!(
+                track_values.len() == self.data_keys.len(),
+                "segment {} supplies {} tracks, expected {}",
+                range.pretty_show(),
+                track_values.len(),
+                self.data_keys.len()
+            );
+            for (index, (key, _)) in track_values.iter().enumerate() {
+                let expected_key = self.data_keys.get_index(index).unwrap();
+                ensure!(
+                    key == expected_key,
+                    "segment {} has track {} at position {}, expected {}",
+                    range.pretty_show(),
+                    key,
+                    index,
+                    expected_key
+                );
+            }
+        }
+
+        let file_path = self.location.join(range.pretty_show());
+        let mut file = File::create_new(&file_path).with_context(|| {
+            format!("Failed to create sequence file at: {}", file_path.display())
+        })?;
+        let encoded_sequence = compress_data_zst(sequence.to_vec(), 5);
+        file.write_all(&(encoded_sequence.len() as u64).to_le_bytes())?;
+        file.write_all(&encoded_sequence)?;
+
+        let expected_values = (self.total_sequence_length() / self.resolution) as usize;
+        for (_, values) in &track_values {
+            debug_assert_eq!(values.len(), expected_values);
+            let encoded = bincode::serde::encode_to_vec(values, bincode::config::standard())?;
+            let encoded = compress_data_zst(encoded, 5);
+            file.write_all(&(encoded.len() as u64).to_le_bytes())?;
+            file.write_all(&encoded)?;
+        }
+        drop(file);
+
+        self.segments.insert(range, file_path);
+        for key in &self.data_keys {
+            *self
+                .value_counts
+                .get_mut(key)
+                .expect("track was registered") += 1;
+        }
+        Ok(())
+    }
+
+    /// Add a segment that was encoded by a worker thread.  The encoded bytes
+    /// use the same per-segment layout as `add_segment_bf16`, so this method
+    /// only performs ordered index bookkeeping and a single file write.
+    pub(crate) fn add_encoded_segment(
+        &mut self,
+        range: GenomicRange,
+        encoded: Vec<u8>,
+        track_keys: Vec<String>,
+    ) -> Result<()> {
+        ensure!(!track_keys.is_empty(), "at least one track is required");
+        ensure!(!encoded.is_empty(), "encoded segment must not be empty");
+        ensure!(
+            !self.segments.contains_key(&range),
+            "segment {} already exists",
+            range.pretty_show()
+        );
+        for key in &track_keys {
+            ensure!(!key.is_empty(), "track name must not be empty");
+        }
+
+        if self.data_keys.is_empty() {
+            for key in &track_keys {
+                ensure!(
+                    !self.data_keys.contains(key),
+                    "track {} was supplied more than once",
+                    key
+                );
+                self.data_keys.insert(key.clone());
+                self.value_counts.insert(key.clone(), 0);
+            }
+        } else {
+            ensure!(
+                track_keys.len() == self.data_keys.len(),
+                "segment {} supplies {} tracks, expected {}",
+                range.pretty_show(),
+                track_keys.len(),
+                self.data_keys.len()
+            );
+            for (index, key) in track_keys.iter().enumerate() {
+                let expected_key = self.data_keys.get_index(index).unwrap();
+                ensure!(
+                    key == expected_key,
+                    "segment {} has track {} at position {}, expected {}",
+                    range.pretty_show(),
+                    key,
+                    index,
+                    expected_key
+                );
+            }
+        }
+
+        let file_path = self.location.join(range.pretty_show());
+        let mut file = File::create_new(&file_path).with_context(|| {
+            format!("Failed to create sequence file at: {}", file_path.display())
+        })?;
+        file.write_all(&encoded)?;
+        drop(file);
+        self.segments.insert(range, file_path);
+        for key in &self.data_keys {
+            *self
+                .value_counts
+                .get_mut(key)
+                .expect("track was registered") += 1;
+        }
+        Ok(())
+    }
+
     fn add_values(
         &mut self,
         key: impl Into<String>,
         data: impl IndexedParallelIterator<Item = (GenomicRange, Vec<bf16>)>,
     ) -> Result<()> {
         let key = key.into();
+        let n_segments = self.segments.len();
         if self.data_keys.contains(&key) {
             bail!("Data key {} already exists", &key);
         }
-        self.data_keys.insert(key);
+        self.data_keys.insert(key.clone());
 
         let val_len = (self.total_sequence_length() / self.resolution) as usize;
         let chunk_size = (data.len() / 32).max(1);
@@ -535,7 +1358,94 @@ impl DataStoreBuilder {
                 file.write_all(&values)?;
                 Ok(())
             })
-        })
+        })?;
+        // add_w5z supplies exactly one value block per segment. Keep the
+        // count for finish()'s consistency check, just as for streamed
+        // add_segment_data calls.
+        self.value_counts.insert(key, n_segments);
+        Ok(())
+    }
+
+    /// Append a batch of already-segmented values for one track.
+    ///
+    /// ``values`` has shape ``(num_segments_in_batch, values_per_segment)``
+    /// and must be supplied in exactly the same order as ``self.segments``.
+    /// ``start_index`` makes it possible to stream a track in bounded-memory
+    /// batches. The values are converted to bfloat16 and appended directly
+    /// to the per-segment temporary files; no W5Z file is involved.
+    pub fn add_segment_data(
+        &mut self,
+        key: impl Into<String>,
+        start_index: usize,
+        values: ndarray::ArrayView2<'_, f32>,
+    ) -> Result<()> {
+        let key = key.into();
+        let n_segments = self.segments.len();
+        ensure!(n_segments > 0, "no segments have been added");
+        ensure!(
+            start_index <= n_segments,
+            "start_index {} exceeds {} segments",
+            start_index,
+            n_segments
+        );
+        ensure!(
+            start_index + values.nrows() <= n_segments,
+            "value batch [{}:{}) exceeds {} segments",
+            start_index,
+            start_index + values.nrows(),
+            n_segments
+        );
+        ensure!(values.nrows() > 0, "value batch must not be empty");
+
+        let expected_values = (self.total_sequence_length() / self.resolution) as usize;
+        ensure!(
+            values.ncols() == expected_values,
+            "values have {} columns, expected {}",
+            values.ncols(),
+            expected_values
+        );
+
+        if start_index == 0 {
+            if self.data_keys.contains(&key) {
+                bail!("Data key {} already exists", key);
+            }
+            self.data_keys.insert(key.clone());
+            self.value_counts.insert(key.clone(), 0);
+        } else {
+            ensure!(
+                self.data_keys.contains(&key),
+                "track {} must start with a batch at start_index=0",
+                key
+            );
+        }
+
+        let already_written = *self.value_counts.get(&key).unwrap_or(&0);
+        ensure!(
+            already_written == start_index,
+            "track {} expects start_index {}, got {}",
+            key,
+            already_written,
+            start_index
+        );
+
+        for (offset, row) in values.outer_iter().enumerate() {
+            let segment_index = start_index + offset;
+            let (_, file_path) = self
+                .segments
+                .get_index(segment_index)
+                .ok_or_else(|| anyhow::anyhow!("invalid segment index {}", segment_index))?;
+            let values: Vec<bf16> = row.iter().map(|value| bf16::from_f32(*value)).collect();
+            let encoded = bincode::serde::encode_to_vec(&values, bincode::config::standard())?;
+            let encoded = compress_data_zst(encoded, 5);
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(file_path)
+                .with_context(|| format!("Failed to open data file at: {}", file_path.display()))?;
+            file.write_all(&(encoded.len() as u64).to_le_bytes())?;
+            file.write_all(&encoded)?;
+        }
+        self.value_counts.insert(key, start_index + values.nrows());
+        Ok(())
     }
 
     pub fn add_w5z(&mut self, key: impl Into<String>, data: W5Z) -> Result<()> {
@@ -583,6 +1493,16 @@ impl DataStoreBuilder {
     }
 
     pub fn finish(mut self, path: impl AsRef<Path>) -> Result<()> {
+        for key in &self.data_keys {
+            let count = self.value_counts.get(key).copied().unwrap_or(0);
+            ensure!(
+                count == self.segments.len(),
+                "track {} has {} segment values, expected {}",
+                key,
+                count,
+                self.segments.len()
+            );
+        }
         path.as_ref()
             .parent()
             .map(|p| std::fs::create_dir_all(p).unwrap());
@@ -651,6 +1571,45 @@ impl DataStoreBuilder {
         store.write_all(&metadata_len.to_le_bytes())?; // 4 bytes
         Ok(())
     }
+}
+
+/// Encode the intermediate per-segment representation.  This is independent
+/// of `DataStoreBuilder` state and can therefore run concurrently in worker
+/// threads before the ordered writer appends the segment to the store.
+pub(crate) fn encode_segment_bf16(
+    sequence: &[u8],
+    track_values: &[(String, Vec<bf16>)],
+    expected_sequence: usize,
+    expected_values: usize,
+) -> Result<Vec<u8>> {
+    ensure!(
+        sequence.len() == expected_sequence,
+        "sequence has length {}, expected {}",
+        sequence.len(),
+        expected_sequence
+    );
+    ensure!(!track_values.is_empty(), "at least one track is required");
+    for (key, values) in track_values {
+        ensure!(!key.is_empty(), "track name must not be empty");
+        ensure!(
+            values.len() == expected_values,
+            "track {} has {} values, expected {}",
+            key,
+            values.len(),
+            expected_values
+        );
+    }
+    let mut encoded = Vec::new();
+    let sequence = compress_data_zst(sequence.to_vec(), 5);
+    encoded.extend_from_slice(&(sequence.len() as u64).to_le_bytes());
+    encoded.extend_from_slice(&sequence);
+    for (_, values) in track_values {
+        let values = bincode::serde::encode_to_vec(values, bincode::config::standard())?;
+        let values = compress_data_zst(values, 5);
+        encoded.extend_from_slice(&(values.len() as u64).to_le_bytes());
+        encoded.extend_from_slice(&values);
+    }
+    Ok(encoded)
 }
 
 fn compress_data_file(file_path: impl AsRef<Path>, nrow: usize) -> Result<(Vec<u8>, usize)> {
@@ -787,7 +1746,8 @@ fn read_metadata(file: &mut std::fs::File) -> Result<StoreMetadata> {
 
 /// Array Helper
 
-/// Aggregate the values along the sequence axis (axis 1).
+/// Aggregate the values along the sequence axis for channels-last arrays
+/// `(batch, sequence, track)`.
 fn aggregate_by_length(arr: Array3<bf16>, size: usize) -> Array3<bf16> {
     let (d, h, w) = arr.dim();
     if h % size != 0 {
@@ -805,6 +1765,29 @@ fn aggregate_by_length(arr: Array3<bf16>, size: usize) -> Array3<bf16> {
         .unwrap()
         .mapv(|x| bf16::from_f64(x));
     data
+}
+
+/// Aggregate values while preserving either supported output layout.
+fn aggregate_by_length_layout(arr: Array3<bf16>, size: usize, channels_last: bool) -> Array3<bf16> {
+    if channels_last {
+        return aggregate_by_length(arr, size);
+    }
+
+    // Channels-first: (batch, track, sequence).
+    let (d, w, h) = arr.dim();
+    if h % size != 0 {
+        panic!(
+            "Cannot aggregate values of length {} by size {}: length is not a multiple of size",
+            h, size
+        );
+    }
+    let num_chunks = h / size;
+    arr.into_shape_with_order((d, w, num_chunks, size))
+        .unwrap()
+        .mapv(|x| x.to_f64())
+        .mean_axis(Axis(3))
+        .unwrap()
+        .mapv(|x| bf16::from_f64(x))
 }
 
 /// Split the values into consecutive chunks on the second dimension (the sequence).
@@ -838,6 +1821,33 @@ fn split_data(arr: Array3<bf16>, size: usize) -> Result<Array3<bf16>> {
     Ok(result)
 }
 
+/// Split values while preserving either supported output layout.
+fn split_data_layout(arr: Array3<bf16>, size: usize, channels_last: bool) -> Result<Array3<bf16>> {
+    if channels_last {
+        return split_data(arr, size);
+    }
+
+    // Channels-first input: (batch, track, sequence).  Expose the chunk axis,
+    // move it next to batch, and materialise the resulting standard layout so
+    // the final shape is (batch * chunks, track, chunk_sequence).
+    let (d, w, h) = arr.dim();
+    if size == 0 || h % size != 0 {
+        bail!(
+            "Cannot split values of length {} into chunks of size {}",
+            h,
+            size
+        );
+    }
+    let num_chunks = h / size;
+    let result = arr
+        .into_shape_with_order((d, w, num_chunks, size))?
+        .permuted_axes([0, 2, 1, 3])
+        .as_standard_layout()
+        .to_owned()
+        .into_shape_with_order((d * num_chunks, w, size))?;
+    Ok(result)
+}
+
 fn split_sequence(arr: ArrayView2<u8>, size: usize) -> Result<ArrayView2<u8>> {
     let (d, h) = arr.dim();
 
@@ -860,7 +1870,10 @@ fn split_sequence(arr: ArrayView2<u8>, size: usize) -> Result<ArrayView2<u8>> {
     Ok(result)
 }
 
-/// Perform in-place scaling and clamping on the values.
+/// Perform the optional in-place value transformation.
+///
+/// NaN replacement is part of this pass and is therefore only performed when
+/// the caller has requested scaling or clamping.
 fn transform(mut arr: ArrayViewMut3<bf16>, scale: Option<bf16>, clamp_max: Option<bf16>) {
     arr.map_inplace(|x| {
         if x.is_nan() {
@@ -987,6 +2000,20 @@ mod tests {
     }
 
     #[test]
+    fn test_native_resolution_skips_aggregation() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let location = temp_dir.as_ref().join("store.gdata");
+        create_store(&location, 64, 2, 4, 1, 1);
+
+        let mut options = DataStoreReadOptions::default();
+        options.read_resolution = Some(2);
+        let store = DataStore::open(location, options).unwrap();
+
+        assert_eq!(store.out_resolution, 2);
+        assert_eq!(store.aggregate_size, None);
+    }
+
+    #[test]
     fn test_datastore() {
         let temp_dir = tempfile::tempdir().unwrap();
         let location = temp_dir.as_ref().join("store.gdata");
@@ -1000,6 +2027,25 @@ mod tests {
         assert_eq!(
             v.0.mapv(|x| x.to_f32()),
             array.slice(s![2..3, 8 / 2..(1024 + 8) / 2, ..]).to_owned()
+        );
+
+        let region = store
+            .inner
+            .metadata
+            .segment_index
+            .get_index(2)
+            .unwrap()
+            .0
+            .clone();
+        let (_, values_channels_first) = store.read_bf16_with_layout(&region, false).unwrap();
+        assert_eq!(values_channels_first.shape(), [1, 10, 512]);
+        assert!(values_channels_first.is_standard_layout());
+        assert_eq!(
+            values_channels_first.mapv(|x| x.to_f32()),
+            array
+                .slice(s![2..3, 8 / 2..(1024 + 8) / 2, ..])
+                .permuted_axes([0, 2, 1])
+                .to_owned()
         );
 
         let values_iter = store.par_iter(3, 2, false, None);

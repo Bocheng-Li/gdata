@@ -1,4 +1,4 @@
-pub mod genome;
 pub(crate) mod generic;
+pub mod genome;
 
 pub use generic::DataLoader;
