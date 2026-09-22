@@ -24,7 +24,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::dataloader::generic::{split_n_with_batch_size, ParallelLoader, ReBatch};
+use crate::dataloader::generic::{
+    split_n_with_batch_size, ParallelLoader, ReBatch, StreamingParallelLoader,
+};
 use crate::w5z::W5Z;
 
 use super::super::generic::{compress_data_zst, decompress_data_zst};
@@ -924,7 +926,7 @@ impl DataStore {
     /// This is the low-level iterator used by the runtime center-crop/split
     /// augmentation path.  `regions` is already ordered by the caller; the
     /// method deliberately does not shuffle it so that multiple synchronized
-    /// loaders can consume exactly the same parent order.
+    /// loaders can consume the same parent order.
     pub fn par_iter_bf16_with_layout_and_regions(
         &mut self,
         regions: Vec<GenomicRange>,
@@ -947,17 +949,16 @@ impl DataStore {
     ///
     /// This is intentionally separate from the regular region iterator: the
     /// latter applies the logical window crop and is therefore not suitable
-    /// for runtime center/shift augmentation.
+    /// for runtime center/shift augmentation.  The returned stream emits a
+    /// parent as soon as any worker completes it; consumers that combine
+    /// modalities must therefore synchronize by genomic range.
     pub fn par_iter_bf16_parent_with_layout_and_regions(
         &mut self,
         regions: Vec<GenomicRange>,
         num_threads: usize,
         channels_last: bool,
         include_sequence: bool,
-    ) -> ParallelLoader<
-        DataStoreBf16ParentRegionIter,
-        (GenomicRange, u64, Option<Array2<u8>>, Array3<bf16>),
-    > {
+    ) -> StreamingParallelLoader<(GenomicRange, u64, Option<Array2<u8>>, Array3<bf16>)> {
         let num_threads = num_threads.max(1);
         let iters = split_n_with_batch_size(&regions, num_threads, 1)
             .into_iter()
@@ -968,7 +969,10 @@ impl DataStore {
                 include_sequence,
             })
             .collect::<Vec<_>>();
-        ParallelLoader::new(iters)
+        // Keep roughly one completed parent per worker in flight, but do not
+        // wait for all workers to finish before exposing the first completed
+        // parent.  The old ParallelLoader introduced a refill barrier here.
+        StreamingParallelLoader::new(iters, num_threads)
     }
 }
 

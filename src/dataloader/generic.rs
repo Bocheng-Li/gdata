@@ -5,6 +5,7 @@ use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
 use rayon::str;
 use serde::Serialize;
 use std::os::unix::fs::FileExt;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{sync_channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::{
@@ -327,6 +328,79 @@ where
     }
 }
 
+/// A streaming counterpart to [`ParallelLoader`].
+///
+/// `ParallelLoader` is deliberately kept for the legacy, order-preserving
+/// paths.  It refills a `VecDeque` by waiting for every worker and collecting
+/// one item from each worker.  That creates a visible batch barrier when one
+/// record is substantially slower than the others.
+///
+/// This loader gives every worker its own producer thread and sends each item
+/// as soon as that worker finishes it.  Results are intentionally unordered;
+/// callers that synchronize several streams must match items using their
+/// record key rather than relying on positional iteration.
+enum StreamingMessage<T> {
+    Item(T),
+    WorkerPanic(Box<dyn std::any::Any + Send + 'static>),
+}
+
+pub(crate) struct StreamingParallelLoader<T> {
+    receiver: Receiver<StreamingMessage<T>>,
+}
+
+impl<T: Send + 'static> StreamingParallelLoader<T> {
+    /// Start one producer thread per input iterator.
+    ///
+    /// `buffer_size` is the total number of completed records allowed to wait
+    /// between the producers and the consumer.  A small bounded queue keeps
+    /// memory use comparable to the old per-worker buffer while removing the
+    /// all-workers-must-finish barrier.
+    pub(crate) fn new<L>(loaders: Vec<L>, buffer_size: usize) -> Self
+    where
+        L: Iterator<Item = T> + Send + 'static,
+    {
+        let (sender, receiver) = sync_channel(buffer_size.max(1));
+
+        for mut loader in loaders {
+            let worker_sender = sender.clone();
+            std::thread::Builder::new()
+                .name("gdata-stream-worker".to_string())
+                .spawn(move || {
+                    // Preserve the old behavior for malformed records: a
+                    // panic in a worker is re-raised by the consumer instead
+                    // of silently truncating the iterator.
+                    let result = catch_unwind(AssertUnwindSafe(|| {
+                        while let Some(item) = loader.next() {
+                            if worker_sender.send(StreamingMessage::Item(item)).is_err() {
+                                return;
+                            }
+                        }
+                    }));
+                    if let Err(payload) = result {
+                        let _ = worker_sender.send(StreamingMessage::WorkerPanic(payload));
+                    }
+                })
+                .expect("failed to spawn gdata streaming worker");
+        }
+        // The worker clones are the only remaining senders.  Once all workers
+        // finish, recv() observes channel closure and yields None.
+        drop(sender);
+
+        Self { receiver }
+    }
+}
+
+impl<T: Send + 'static> Iterator for StreamingParallelLoader<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.receiver.recv().ok()? {
+            StreamingMessage::Item(item) => Some(item),
+            StreamingMessage::WorkerPanic(payload) => resume_unwind(payload),
+        }
+    }
+}
+
 /// PrefetchIterator allows for prefetching items from an iterator into a buffer.
 pub struct PrefethIterator<T>(Arc<Mutex<Receiver<T>>>);
 
@@ -566,6 +640,68 @@ mod tests {
             random_values,
             ParallelLoader::new(iters).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn streaming_loader_forwards_a_completed_item_without_a_refill_barrier() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc::sync_channel, Arc, Barrier};
+        use std::thread;
+        use std::time::Duration;
+
+        struct GatedIterator {
+            barrier: Arc<Barrier>,
+            release: Arc<AtomicBool>,
+            value: Option<i32>,
+            wait_for_release: bool,
+        }
+
+        impl Iterator for GatedIterator {
+            type Item = i32;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                let value = self.value.take()?;
+                self.barrier.wait();
+                if self.wait_for_release {
+                    while !self.release.load(Ordering::Acquire) {
+                        thread::yield_now();
+                    }
+                }
+                Some(value)
+            }
+        }
+
+        // Both workers start together.  The first worker is deliberately
+        // held back; the second one must still be observable immediately.
+        let barrier = Arc::new(Barrier::new(3));
+        let release = Arc::new(AtomicBool::new(false));
+        let slow = GatedIterator {
+            barrier: barrier.clone(),
+            release: release.clone(),
+            value: Some(1),
+            wait_for_release: true,
+        };
+        let fast = GatedIterator {
+            barrier: barrier.clone(),
+            release: release.clone(),
+            value: Some(2),
+            wait_for_release: false,
+        };
+        let mut stream = StreamingParallelLoader::new(vec![slow, fast], 2);
+        barrier.wait();
+
+        let (result_sender, result_receiver) = sync_channel(1);
+        let handle = thread::spawn(move || {
+            result_sender.send(stream.next()).unwrap();
+        });
+        let first = result_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("stream waited for the slow worker")
+            .expect("stream ended before the fast worker result");
+        assert_eq!(first, 2);
+
+        release.store(true, Ordering::Release);
+        handle.join().unwrap();
     }
 
     #[test]

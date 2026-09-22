@@ -44,3 +44,9 @@ file, so the compressed bytes must still be read and decompressed per head.
 `NativeGDataDataLoader` is also available as
 `gdata.NativeGDataDataLoader`.  PyTorch is imported only when the adapter is
 used; the core `gdata` reader remains usable without PyTorch.
+
+The native center/split path uses a streaming worker queue: a completed parent
+is forwarded immediately instead of waiting for the other workers in the same
+refill batch.  Consequently, parent records can arrive in completion order;
+for a `GenomeDataLoaderMap`, modalities are synchronized by their genomic
+range before the shared augmentation plan is applied.

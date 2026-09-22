@@ -10,12 +10,13 @@ use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha12Rng;
 use std::str::FromStr;
-use std::{collections::HashSet, path::PathBuf};
-
-use super::super::generic::{ParallelLoader, PrefethIterator};
-use crate::dataloader::genome::data_store::{
-    decode_nucleotide, DataStore, DataStoreBf16ParentRegionIter, DataStoreReadOptions,
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
 };
+
+use super::super::generic::{PrefethIterator, StreamingParallelLoader};
+use crate::dataloader::genome::data_store::{decode_nucleotide, DataStore, DataStoreReadOptions};
 use crate::dataloader::genome::dlpack::into_dlpack;
 
 /// A parent record together with the arrays needed by the native augmentation
@@ -951,7 +952,7 @@ impl GenomeDataLoader {
         regions: Vec<GenomicRange>,
         channels_last: bool,
         include_sequence: bool,
-    ) -> ParallelLoader<DataStoreBf16ParentRegionIter, RegionBFloat16Record> {
+    ) -> StreamingParallelLoader<RegionBFloat16Record> {
         self.data_store
             .clone()
             .par_iter_bf16_parent_with_layout_and_regions(
@@ -1833,11 +1834,52 @@ impl DataIndexer {
 #[derive(Debug, Clone)]
 pub struct GenomeDataLoaderMap(IndexMap<String, GenomeDataLoader>);
 
-/// Synchronously pair region-preserving native iterators from all heads.  The
-/// parent order is supplied by the map, so every modality consumes the same
-/// genomic record before the shared center/split plan is applied.
+/// Pair region-preserving native iterators from all heads.
+///
+/// The underlying streaming workers deliberately return records as soon as
+/// they finish, so different modality streams are not guaranteed to have the
+/// same arrival order.  The first head defines the output order; records from
+/// the other heads are matched by genomic range and temporarily held in their
+/// pending maps when they arrive early.
 struct MultiRegionBFloat16Iterator {
-    iters: IndexMap<String, ParallelLoader<DataStoreBf16ParentRegionIter, RegionBFloat16Record>>,
+    iters: IndexMap<String, StreamingParallelLoader<RegionBFloat16Record>>,
+    pending: IndexMap<String, HashMap<GenomicRange, RegionBFloat16Record>>,
+    finished: bool,
+}
+
+impl MultiRegionBFloat16Iterator {
+    fn finish(&mut self) {
+        self.finished = true;
+        // Closing all receivers immediately tells modality workers that no
+        // consumer remains.  This matters when the first stream reaches EOF
+        // slightly before another stream or when the caller stops early.
+        self.iters.clear();
+        self.pending.clear();
+    }
+
+    fn take_matching(
+        tag: &str,
+        iter: &mut StreamingParallelLoader<RegionBFloat16Record>,
+        pending: &mut HashMap<GenomicRange, RegionBFloat16Record>,
+        expected_region: &GenomicRange,
+    ) -> Option<RegionBFloat16Record> {
+        if let Some(record) = pending.remove(expected_region) {
+            return Some(record);
+        }
+
+        loop {
+            let record = iter.next()?;
+            if &record.0 == expected_region {
+                return Some(record);
+            }
+
+            let region = record.0.clone();
+            assert!(
+                pending.insert(region.clone(), record).is_none(),
+                "duplicate parent region {region} received from modality {tag}"
+            );
+        }
+    }
 }
 
 impl Iterator for MultiRegionBFloat16Iterator {
@@ -1849,42 +1891,62 @@ impl Iterator for MultiRegionBFloat16Iterator {
     );
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut region = None;
-        let mut physical_start = None;
-        let mut sequence = None;
+        if self.finished {
+            return None;
+        }
+        let first_tag = self.iters.keys().next()?.clone();
+        let first_record = self.iters.get_mut(&first_tag)?.next();
+        let (region, physical_start, sequence, first_values) = match first_record {
+            Some(record) => record,
+            None => {
+                self.finish();
+                return None;
+            }
+        };
+        let sequence = match sequence {
+            Some(sequence) => sequence,
+            None => {
+                self.finish();
+                return None;
+            }
+        };
         let mut values = IndexMap::new();
-        for (tag, iter) in self.iters.iter_mut() {
+        values.insert(first_tag.clone(), first_values);
+
+        // Collect the tags first so that the mutable borrows of `iters` and
+        // `pending` do not overlap with iteration over the IndexMaps.
+        let other_tags: Vec<String> = self.iters.keys().skip(1).cloned().collect();
+        for tag in other_tags {
+            let matched = {
+                let iter = self.iters.get_mut(&tag).unwrap();
+                let pending = self.pending.get_mut(&tag).unwrap();
+                Self::take_matching(tag.as_str(), iter, pending, &region)
+            };
             let (current_region, current_physical_start, current_sequence, current_values) =
-                iter.next()?;
-            if let Some(expected) = region.as_ref() {
-                assert_eq!(
-                    expected, &current_region,
-                    "all genome data loaders must yield the same parent region"
-                );
-            } else {
-                region = Some(current_region.clone());
-            }
-            if let Some(expected) = physical_start {
-                assert_eq!(
-                    expected, current_physical_start,
-                    "all genome data loaders must have the same parent origin"
-                );
-            } else {
-                physical_start = Some(current_physical_start);
-            }
+                match matched {
+                    Some(record) => record,
+                    None => {
+                        self.finish();
+                        return None;
+                    }
+                };
+            assert_eq!(
+                &region, &current_region,
+                "all genome data loaders must yield the same parent region"
+            );
+            assert_eq!(
+                physical_start, current_physical_start,
+                "all genome data loaders must have the same parent origin"
+            );
             if let Some(current_sequence) = current_sequence {
-                if let Some(expected) = sequence.as_ref() {
-                    assert_eq!(
-                        expected, &current_sequence,
-                        "genome data loaders yielded different DNA sequences"
-                    );
-                } else {
-                    sequence = Some(current_sequence);
-                }
+                assert_eq!(
+                    sequence, current_sequence,
+                    "genome data loaders yielded different DNA sequences"
+                );
             }
             values.insert(tag.clone(), current_values);
         }
-        Some((region?, physical_start?, sequence?, values))
+        Some((region, physical_start, sequence, values))
     }
 }
 
@@ -2110,7 +2172,7 @@ impl GenomeDataLoaderMap {
         }
 
         let regions = first.ordered_regions();
-        let raw_iters = self
+        let raw_iters: IndexMap<String, StreamingParallelLoader<RegionBFloat16Record>> = self
             .0
             .iter()
             .enumerate()
@@ -2125,7 +2187,16 @@ impl GenomeDataLoaderMap {
                 )
             })
             .collect();
-        let raw = MultiRegionBFloat16Iterator { iters: raw_iters };
+        let pending = raw_iters
+            .keys()
+            .cloned()
+            .map(|tag| (tag, HashMap::new()))
+            .collect();
+        let raw = MultiRegionBFloat16Iterator {
+            iters: raw_iters,
+            pending,
+            finished: false,
+        };
         let mut rng = ChaCha12Rng::seed_from_u64(first.random_seed ^ 0x6a09e667f3bcc909);
         let augmented = raw.map(move |(region, physical_start, sequence, values)| {
             center_split_multi_record(
