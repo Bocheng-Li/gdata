@@ -5,7 +5,7 @@ use indexmap::IndexMap;
 use itertools::Itertools;
 use ndarray::{Array2, Array3, Axis};
 use numpy::{PyArray2, PyArray3};
-use pyo3::{prelude::*, py_run};
+use pyo3::{prelude::*, py_run, types::PyDict};
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha12Rng;
@@ -314,6 +314,62 @@ fn center_split_record(
         channels_last,
         &plan,
     )
+}
+
+/// Concatenate complete native parent outputs into one segment batch.
+///
+/// The center/split iterator intentionally yields all segments from one
+/// parent together.  The Python training adapter, however, usually wants a
+/// conventional segment batch.  Doing this concatenation in Rust avoids one
+/// Python ``next()`` call and one Python-side stack operation per parent.
+fn combine_augmented_bfloat16_records(
+    records: Vec<AugmentedBFloat16Record>,
+) -> Result<AugmentedBFloat16Record> {
+    ensure!(!records.is_empty(), "cannot combine an empty record list");
+    let first = records.first().unwrap();
+    let segments_per_parent = first.0.shape()[0];
+    let sequence_length = first.0.shape()[1];
+    let value_dim_1 = first.1.shape()[1];
+    let value_dim_2 = first.1.shape()[2];
+    ensure!(segments_per_parent > 0, "native record has no segments");
+
+    let total_segments: usize = records.iter().map(|record| record.0.shape()[0]).sum();
+    let mut sequence = Array2::<u8>::zeros((total_segments, sequence_length));
+    let mut values = Array3::<bf16>::from_elem(
+        (total_segments, value_dim_1, value_dim_2),
+        bf16::from_f32(0.0),
+    );
+    let mut metadata = Vec::with_capacity(total_segments);
+    let mut output_start = 0;
+
+    for (current_sequence, current_values, current_metadata) in records {
+        let current_segments = current_sequence.shape()[0];
+        ensure!(
+            current_sequence.shape()[1] == sequence_length,
+            "native batch contains incompatible sequence lengths"
+        );
+        ensure!(
+            current_values.shape()
+                == [current_segments, value_dim_1, value_dim_2],
+            "native batch contains incompatible value shapes"
+        );
+        ensure!(
+            current_metadata.len() == current_segments,
+            "native batch metadata does not match the number of segments"
+        );
+
+        let output_end = output_start + current_segments;
+        sequence
+            .slice_mut(ndarray::s![output_start..output_end, ..])
+            .assign(&current_sequence);
+        values
+            .slice_mut(ndarray::s![output_start..output_end, .., ..])
+            .assign(&current_values);
+        metadata.extend(current_metadata);
+        output_start = output_end;
+    }
+
+    Ok((sequence, values, metadata))
 }
 
 #[cfg(test)]
@@ -772,6 +828,7 @@ impl GenomeDataLoader {
                 self.n_jobs.max(1).saturating_mul(prefetch_multiplier),
             ),
             seq_as_string: self.seq_as_string,
+            num_segments: config.num_segments,
         })
     }
 }
@@ -1252,6 +1309,7 @@ pub struct GenomeDataLoaderBFloat16DLPackIter {
 pub struct GenomeDataLoaderAugmentedBFloat16DLPackIter {
     iter: PrefethIterator<AugmentedBFloat16Record>,
     seq_as_string: bool,
+    num_segments: usize,
 }
 
 impl Iterator for GenomeDataLoaderAugmentedBFloat16DLPackIter {
@@ -1263,6 +1321,48 @@ impl Iterator for GenomeDataLoaderAugmentedBFloat16DLPackIter {
             sequence.mapv_inplace(|x| decode_nucleotide(x).unwrap());
         }
         Some((sequence, values, metadata))
+    }
+}
+
+impl GenomeDataLoaderAugmentedBFloat16DLPackIter {
+    /// Consume enough parent records to form one conventional segment batch.
+    ///
+    /// ``batch_size`` is measured in output segments, not parent records.  A
+    /// batch must be a multiple of ``num_segments`` because every parent is
+    /// kept intact and contributes all of its segments.  This keeps the
+    /// operation zero-ambiguity and lets the concatenation happen in Rust.
+    fn next_batch_records(
+        &mut self,
+        batch_size: usize,
+        drop_last: bool,
+    ) -> Result<Option<AugmentedBFloat16Record>> {
+        ensure!(batch_size > 0, "batch_size must be positive");
+        ensure!(
+            batch_size % self.num_segments == 0,
+            "batch_size ({batch_size}) must be a multiple of segments_length ({})",
+            self.num_segments
+        );
+
+        let parents_per_batch = batch_size / self.num_segments;
+        let mut records = Vec::with_capacity(parents_per_batch);
+        for _ in 0..parents_per_batch {
+            let Some(record) = self.next() else {
+                break;
+            };
+            records.push(record);
+        }
+        if records.is_empty() {
+            return Ok(None);
+        }
+
+        let actual_segments: usize = records
+            .iter()
+            .map(|record| record.0.shape()[0])
+            .sum();
+        if actual_segments < batch_size && drop_last {
+            return Ok(None);
+        }
+        Ok(Some(combine_augmented_bfloat16_records(records)?))
     }
 }
 
@@ -1289,6 +1389,49 @@ impl GenomeDataLoaderAugmentedBFloat16DLPackIter {
             (sequence, values, metadata).into_pyobject(py).unwrap()
         };
         Ok(Some(result))
+    }
+
+    /// Return a Rust-concatenated batch of segments as
+    /// ``(sequence_numpy, values_dlpack, metadata)``.
+    #[pyo3(signature = (batch_size, drop_last=false))]
+    fn next_batch<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        py: Python<'a>,
+        batch_size: usize,
+        drop_last: bool,
+    ) -> PyResult<Option<Bound<'a, pyo3::types::PyTuple>>> {
+        let Some((sequence, values, metadata)) = slf
+            .next_batch_records(batch_size, drop_last)
+            .map_err(PyErr::from)?
+        else {
+            return Ok(None);
+        };
+        let values = into_dlpack(py, values)?;
+        let metadata = metadata.into_pyobject(py)?;
+        let sequence = PyArray2::from_owned_array(py, sequence);
+        Ok(Some((sequence, values, metadata).into_pyobject(py)?))
+    }
+
+    /// Wrap this raw iterator with the optional PyTorch tokenizer and batch
+    /// adapter.  The low-level Rust API keeps tokenization out of the reader;
+    /// this convenience method loads the adapter only when requested.
+    #[pyo3(signature = (batch_size, tokenizer=None, drop_last=false))]
+    fn dataloader<'a>(
+        slf: Py<Self>,
+        py: Python<'a>,
+        batch_size: usize,
+        tokenizer: Option<Py<PyAny>>,
+        drop_last: bool,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let module = PyModule::import(py, "gdata")?;
+        let class = module.getattr("NativeGDataDataLoader")?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("batch_size", batch_size)?;
+        kwargs.set_item("drop_last", drop_last)?;
+        if let Some(tokenizer) = tokenizer {
+            kwargs.set_item("tokenizer", tokenizer)?;
+        }
+        class.call((slf,), Some(&kwargs))
     }
 }
 
@@ -1469,6 +1612,76 @@ type MultiAugmentedBFloat16Record = (
     Vec<AugmentedSegmentMetadata>,
 );
 
+/// Concatenate synchronized multi-head parent outputs into one segment batch.
+fn combine_multi_augmented_bfloat16_records(
+    records: Vec<MultiAugmentedBFloat16Record>,
+) -> Result<MultiAugmentedBFloat16Record> {
+    ensure!(!records.is_empty(), "cannot combine an empty record list");
+    let first = records.first().unwrap();
+    let segments_per_parent = first.0.shape()[0];
+    let sequence_length = first.0.shape()[1];
+    ensure!(segments_per_parent > 0, "native record has no segments");
+
+    let total_segments: usize = records.iter().map(|record| record.0.shape()[0]).sum();
+    let mut sequence = Array2::<u8>::zeros((total_segments, sequence_length));
+    let mut metadata = Vec::with_capacity(total_segments);
+    let mut values = IndexMap::new();
+
+    for (tag, first_values) in &first.1 {
+        ensure!(
+            first_values.shape()[0] == segments_per_parent,
+            "multi-head values do not match the sequence segment count"
+        );
+        values.insert(
+            tag.clone(),
+            Array3::<bf16>::from_elem(
+                (total_segments, first_values.shape()[1], first_values.shape()[2]),
+                bf16::from_f32(0.0),
+            ),
+        );
+    }
+
+    let mut output_start = 0;
+    for (current_sequence, current_values, current_metadata) in records {
+        let current_segments = current_sequence.shape()[0];
+        ensure!(
+            current_sequence.shape()[1] == sequence_length,
+            "native multi-head batch contains incompatible sequence lengths"
+        );
+        ensure!(
+            current_metadata.len() == current_segments,
+            "native multi-head metadata does not match the number of segments"
+        );
+        let output_end = output_start + current_segments;
+        sequence
+            .slice_mut(ndarray::s![output_start..output_end, ..])
+            .assign(&current_sequence);
+
+        ensure!(
+            current_values.len() == values.len(),
+            "native multi-head batch contains incompatible head sets"
+        );
+        for (tag, current_array) in current_values {
+            let output_array = values
+                .get_mut(&tag)
+                .ok_or_else(|| anyhow::anyhow!("native batch is missing head {tag}"))?;
+            ensure!(
+                current_array.shape()[0] == current_segments
+                    && current_array.shape()[1] == output_array.shape()[1]
+                    && current_array.shape()[2] == output_array.shape()[2],
+                "native multi-head batch contains incompatible shape for {tag}"
+            );
+            output_array
+                .slice_mut(ndarray::s![output_start..output_end, .., ..])
+                .assign(&current_array);
+        }
+        metadata.extend(current_metadata);
+        output_start = output_end;
+    }
+
+    Ok((sequence, values, metadata))
+}
+
 fn center_split_multi_record(
     region: GenomicRange,
     physical_start: u64,
@@ -1623,6 +1836,7 @@ impl GenomeDataLoaderMap {
                 first.n_jobs.max(1).saturating_mul(prefetch_multiplier),
             ),
             seq_as_string: first.seq_as_string,
+            num_segments: config.num_segments,
         })
     }
 }
@@ -1950,6 +2164,7 @@ impl MultiBFloat16DLPackIter {
 pub struct MultiAugmentedBFloat16DLPackIter {
     iter: PrefethIterator<MultiAugmentedBFloat16Record>,
     seq_as_string: bool,
+    num_segments: usize,
 }
 
 impl Iterator for MultiAugmentedBFloat16DLPackIter {
@@ -1961,6 +2176,42 @@ impl Iterator for MultiAugmentedBFloat16DLPackIter {
             sequence.mapv_inplace(|x| decode_nucleotide(x).unwrap());
         }
         Some((sequence, values, metadata))
+    }
+}
+
+impl MultiAugmentedBFloat16DLPackIter {
+    fn next_batch_records(
+        &mut self,
+        batch_size: usize,
+        drop_last: bool,
+    ) -> Result<Option<MultiAugmentedBFloat16Record>> {
+        ensure!(batch_size > 0, "batch_size must be positive");
+        ensure!(
+            batch_size % self.num_segments == 0,
+            "batch_size ({batch_size}) must be a multiple of segments_length ({})",
+            self.num_segments
+        );
+
+        let parents_per_batch = batch_size / self.num_segments;
+        let mut records = Vec::with_capacity(parents_per_batch);
+        for _ in 0..parents_per_batch {
+            let Some(record) = self.next() else {
+                break;
+            };
+            records.push(record);
+        }
+        if records.is_empty() {
+            return Ok(None);
+        }
+
+        let actual_segments: usize = records
+            .iter()
+            .map(|record| record.0.shape()[0])
+            .sum();
+        if actual_segments < batch_size && drop_last {
+            return Ok(None);
+        }
+        Ok(Some(combine_multi_augmented_bfloat16_records(records)?))
     }
 }
 
@@ -1991,6 +2242,51 @@ impl MultiAugmentedBFloat16DLPackIter {
             (sequence, values, metadata).into_pyobject(py)?
         };
         Ok(Some(result))
+    }
+
+    /// Return a Rust-concatenated synchronized multi-head batch.
+    #[pyo3(signature = (batch_size, drop_last=false))]
+    fn next_batch<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        py: Python<'a>,
+        batch_size: usize,
+        drop_last: bool,
+    ) -> PyResult<Option<Bound<'a, pyo3::types::PyTuple>>> {
+        let Some((sequence, values, metadata)) = slf
+            .next_batch_records(batch_size, drop_last)
+            .map_err(PyErr::from)?
+        else {
+            return Ok(None);
+        };
+
+        let values = values
+            .into_iter()
+            .map(|(tag, value)| Ok((tag, into_dlpack(py, value)?)))
+            .collect::<PyResult<IndexMap<_, _>>>()?;
+        let metadata = metadata.into_pyobject(py)?;
+        let sequence = PyArray2::from_owned_array(py, sequence);
+        Ok(Some((sequence, values, metadata).into_pyobject(py)?))
+    }
+
+    /// Wrap this raw iterator with the package-level optional PyTorch
+    /// tokenizer and batch adapter.
+    #[pyo3(signature = (batch_size, tokenizer=None, drop_last=false))]
+    fn dataloader<'a>(
+        slf: Py<Self>,
+        py: Python<'a>,
+        batch_size: usize,
+        tokenizer: Option<Py<PyAny>>,
+        drop_last: bool,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let module = PyModule::import(py, "gdata")?;
+        let class = module.getattr("NativeGDataDataLoader")?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("batch_size", batch_size)?;
+        kwargs.set_item("drop_last", drop_last)?;
+        if let Some(tokenizer) = tokenizer {
+            kwargs.set_item("tokenizer", tokenizer)?;
+        }
+        class.call((slf,), Some(&kwargs))
     }
 }
 

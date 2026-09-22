@@ -16,3 +16,4 @@ build-backend = "maturin"
 [tool.maturin]
 features = ["pyo3/extension-module"]
 module-name = "gdata"
+python-source = "python"
