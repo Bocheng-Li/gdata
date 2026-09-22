@@ -1,4 +1,4 @@
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use bed_utils::bed::{BEDLike, GenomicRange};
 use half::bf16;
 use indexmap::IndexMap;
@@ -21,12 +21,13 @@ use crate::dataloader::genome::dlpack::into_dlpack;
 /// A parent record together with the arrays needed by the native augmentation
 /// path.  The genomic range is retained so that the output coordinates can be
 /// updated after the center crop and split.
-type RegionBFloat16Record = (GenomicRange, u64, Array2<u8>, Array3<bf16>);
+type RegionBFloat16Record = (GenomicRange, u64, Option<Array2<u8>>, Array3<bf16>);
 
 /// Metadata for one output segment.  The second field is the signed shift in
 /// base pairs relative to the center of the parent record; the third field is
-/// the segment's logical index before the random output ordering is applied.
-type AugmentedSegmentMetadata = (String, i64, usize);
+/// the segment's logical index before the random output ordering is applied;
+/// the fourth field records whether this segment was reverse-complemented.
+type AugmentedSegmentMetadata = (String, i64, usize, bool);
 
 type AugmentedBFloat16Record = (Array2<u8>, Array3<bf16>, Vec<AugmentedSegmentMetadata>);
 
@@ -40,6 +41,70 @@ struct CenterSplitConfig {
     num_segments: usize,
     /// Resolution of the values returned by the loader.
     resolution: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReverseGranularity {
+    Segment,
+    Parent,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReverseConfig {
+    probability: f64,
+    granularity: ReverseGranularity,
+}
+
+impl ReverseConfig {
+    fn disabled() -> Self {
+        Self {
+            probability: 0.0,
+            granularity: ReverseGranularity::Segment,
+        }
+    }
+
+    fn parse(probability: f64, granularity: &str) -> Result<Self> {
+        ensure!(
+            probability.is_finite() && (0.0..=1.0).contains(&probability),
+            "reverse_probability must be finite and between 0 and 1"
+        );
+        let granularity = match granularity {
+            "segment" => ReverseGranularity::Segment,
+            "parent" => ReverseGranularity::Parent,
+            other => bail!("reverse_granularity must be 'segment' or 'parent', got '{other}'"),
+        };
+        Ok(Self {
+            probability,
+            granularity,
+        })
+    }
+}
+
+fn validate_reverse_indices(indices: &[usize], n_tracks: usize, label: &str) -> Result<()> {
+    ensure!(
+        indices.len() == n_tracks,
+        "{label} reverse_indices has {} entries, expected {n_tracks}",
+        indices.len()
+    );
+    let mut seen = vec![false; n_tracks];
+    for &index in indices {
+        ensure!(
+            index < n_tracks,
+            "{label} reverse_indices contains out-of-range index {index}"
+        );
+        ensure!(
+            !seen[index],
+            "{label} reverse_indices is not a permutation (duplicate index {index})"
+        );
+        seen[index] = true;
+    }
+    for (index, &source) in indices.iter().enumerate() {
+        ensure!(
+            indices[source] == index,
+            "{label} reverse_indices must be an involution; index {index} maps to {source}"
+        );
+    }
+    Ok(())
 }
 
 /// Validate the options shared by the single- and multi-loader native
@@ -129,11 +194,14 @@ struct CenterSplitPlan {
     shift: i64,
     segment_length: usize,
     order: Vec<usize>,
+    reverse: Vec<bool>,
+    reverse_granularity: ReverseGranularity,
 }
 
 fn make_center_split_plan(
     parent_length: usize,
     config: CenterSplitConfig,
+    reverse_config: ReverseConfig,
     rng: &mut ChaCha12Rng,
 ) -> Result<CenterSplitPlan> {
     let center_length = config.center_length as usize;
@@ -170,12 +238,36 @@ fn make_center_split_plan(
 
     let mut order: Vec<usize> = (0..config.num_segments).collect();
     order.shuffle(rng);
+    let reverse = match reverse_config.granularity {
+        ReverseGranularity::Segment => (0..config.num_segments)
+            .map(|_| rng.random_bool(reverse_config.probability))
+            .collect(),
+        ReverseGranularity::Parent => {
+            let reverse_parent = rng.random_bool(reverse_config.probability);
+            vec![reverse_parent; config.num_segments]
+        }
+    };
     Ok(CenterSplitPlan {
         start,
         shift,
         segment_length: center_length / config.num_segments,
         order,
+        reverse,
+        reverse_granularity: reverse_config.granularity,
     })
+}
+
+impl CenterSplitPlan {
+    /// Return the parent chunk that supplies an output row.  Segment-level
+    /// reversal keeps each row tied to its original chunk; parent-level
+    /// reversal also swaps the logical chunk order.
+    fn source_chunk_index(&self, chunk_index: usize, reverse: bool) -> usize {
+        if reverse && self.reverse_granularity == ReverseGranularity::Parent {
+            self.order.len() - 1 - chunk_index
+        } else {
+            chunk_index
+        }
+    }
 }
 
 fn apply_center_split_plan(
@@ -186,6 +278,7 @@ fn apply_center_split_plan(
     config: CenterSplitConfig,
     channels_last: bool,
     plan: &CenterSplitPlan,
+    reverse_indices: Option<&[usize]>,
 ) -> Result<AugmentedBFloat16Record> {
     ensure!(
         sequence.ndim() == 2 && sequence.shape()[0] == 1,
@@ -211,9 +304,19 @@ fn apply_center_split_plan(
         );
         values.shape()[1]
     };
+    if let Some(indices) = reverse_indices {
+        validate_reverse_indices(indices, n_tracks, "loader")?;
+    }
 
     let output_sequence = split_sequence_with_plan(&sequence, config, plan);
-    let output_values = split_values_with_plan(&values, config, channels_last, plan, n_tracks);
+    let output_values = split_values_with_plan(
+        &values,
+        config,
+        channels_last,
+        plan,
+        n_tracks,
+        reverse_indices,
+    );
     let metadata = segment_metadata(&region, physical_start, plan);
 
     Ok((output_sequence, output_values, metadata))
@@ -226,11 +329,30 @@ fn split_sequence_with_plan(
 ) -> Array2<u8> {
     let mut output = Array2::<u8>::zeros((config.num_segments, plan.segment_length));
     for (output_index, &chunk_index) in plan.order.iter().enumerate() {
-        let chunk_start = plan.start + chunk_index * plan.segment_length;
+        let reverse = plan.reverse[output_index];
+        let source_chunk_index = plan.source_chunk_index(chunk_index, reverse);
+        let chunk_start = plan.start + source_chunk_index * plan.segment_length;
         let chunk_end = chunk_start + plan.segment_length;
-        output
-            .slice_mut(ndarray::s![output_index, ..])
-            .assign(&sequence.slice(ndarray::s![0, chunk_start..chunk_end]));
+        let mut destination = output.slice_mut(ndarray::s![output_index, ..]);
+        if reverse {
+            for (destination_base, &source_base) in destination.iter_mut().zip(
+                sequence
+                    .slice(ndarray::s![0, chunk_start..chunk_end])
+                    .iter()
+                    .rev(),
+            ) {
+                *destination_base = match source_base {
+                    0 => 3,
+                    1 => 2,
+                    2 => 1,
+                    3 => 0,
+                    4 => 4,
+                    other => other,
+                };
+            }
+        } else {
+            destination.assign(&sequence.slice(ndarray::s![0, chunk_start..chunk_end]));
+        }
     }
     output
 }
@@ -241,6 +363,7 @@ fn split_values_with_plan(
     channels_last: bool,
     plan: &CenterSplitPlan,
     n_tracks: usize,
+    reverse_indices: Option<&[usize]>,
 ) -> Array3<bf16> {
     let resolution = config.resolution as usize;
     let segment_value_length = plan.segment_length / resolution;
@@ -256,16 +379,58 @@ fn split_values_with_plan(
         )
     };
     for (output_index, &chunk_index) in plan.order.iter().enumerate() {
-        let chunk_start = (plan.start + chunk_index * plan.segment_length) / resolution;
+        let reverse = plan.reverse[output_index];
+        let source_chunk_index = plan.source_chunk_index(chunk_index, reverse);
+        let chunk_start = (plan.start + source_chunk_index * plan.segment_length) / resolution;
         let chunk_end = chunk_start + segment_value_length;
-        if channels_last {
-            output
-                .slice_mut(ndarray::s![output_index, .., ..])
-                .assign(&values.slice(ndarray::s![0, chunk_start..chunk_end, ..]));
+        if !reverse {
+            if channels_last {
+                output
+                    .slice_mut(ndarray::s![output_index, .., ..])
+                    .assign(&values.slice(ndarray::s![0, chunk_start..chunk_end, ..]));
+            } else {
+                output
+                    .slice_mut(ndarray::s![output_index, .., ..])
+                    .assign(&values.slice(ndarray::s![0, .., chunk_start..chunk_end]));
+            }
+        } else if channels_last {
+            // Each channels-last sequence position is a contiguous row.  Do
+            // the sequence reversal and optional channel permutation in the
+            // same write, rather than allocating Python flip/index_select
+            // intermediates later.
+            for destination_position in 0..segment_value_length {
+                let source_position = chunk_end - 1 - destination_position;
+                let source_row = values.slice(ndarray::s![0, source_position, ..]);
+                let mut destination_row =
+                    output.slice_mut(ndarray::s![output_index, destination_position, ..]);
+                if let Some(indices) = reverse_indices {
+                    for (destination_channel, &source_channel) in
+                        destination_row.iter_mut().zip(indices.iter())
+                    {
+                        *destination_channel = source_row[source_channel];
+                    }
+                } else {
+                    destination_row.assign(&source_row);
+                }
+            }
         } else {
-            output
-                .slice_mut(ndarray::s![output_index, .., ..])
-                .assign(&values.slice(ndarray::s![0, .., chunk_start..chunk_end]));
+            // Channels-first records have one contiguous sequence slice per
+            // channel.  Reverse each slice in place while applying the
+            // output-channel -> input-channel mapping (used by RNA-seq).
+            for destination_channel in 0..n_tracks {
+                let source_channel = reverse_indices
+                    .map(|indices| indices[destination_channel])
+                    .unwrap_or(destination_channel);
+                let source_row =
+                    values.slice(ndarray::s![0, source_channel, chunk_start..chunk_end]);
+                let mut destination_row =
+                    output.slice_mut(ndarray::s![output_index, destination_channel, ..]);
+                for (destination_value, &source_value) in
+                    destination_row.iter_mut().zip(source_row.iter().rev())
+                {
+                    *destination_value = source_value;
+                }
+            }
         }
     }
     output
@@ -278,14 +443,18 @@ fn segment_metadata(
 ) -> Vec<AugmentedSegmentMetadata> {
     plan.order
         .iter()
-        .map(|&chunk_index| {
-            let chunk_start = plan.start + chunk_index * plan.segment_length;
+        .enumerate()
+        .map(|(output_index, &chunk_index)| {
+            let reverse = plan.reverse[output_index];
+            let source_chunk_index = plan.source_chunk_index(chunk_index, reverse);
+            let chunk_start = plan.start + source_chunk_index * plan.segment_length;
             let genomic_start = physical_start + chunk_start as u64;
             let genomic_end = genomic_start + plan.segment_length as u64;
             (
                 format!("{}:{}-{}", region.chrom(), genomic_start, genomic_end),
                 plan.shift,
-                chunk_index,
+                source_chunk_index,
+                reverse,
             )
         })
         .collect()
@@ -298,13 +467,15 @@ fn center_split_record(
     values: Array3<bf16>,
     config: CenterSplitConfig,
     channels_last: bool,
+    reverse_config: ReverseConfig,
+    reverse_indices: Option<&[usize]>,
     rng: &mut ChaCha12Rng,
 ) -> Result<AugmentedBFloat16Record> {
     ensure!(
         sequence.ndim() == 2 && sequence.shape()[0] == 1,
         "native center/split expects a parent batch of one"
     );
-    let plan = make_center_split_plan(sequence.shape()[1], config, rng)?;
+    let plan = make_center_split_plan(sequence.shape()[1], config, reverse_config, rng)?;
     apply_center_split_plan(
         region,
         physical_start,
@@ -313,6 +484,7 @@ fn center_split_record(
         config,
         channels_last,
         &plan,
+        reverse_indices,
     )
 }
 
@@ -349,8 +521,7 @@ fn combine_augmented_bfloat16_records(
             "native batch contains incompatible sequence lengths"
         );
         ensure!(
-            current_values.shape()
-                == [current_segments, value_dim_1, value_dim_2],
+            current_values.shape() == [current_segments, value_dim_1, value_dim_2],
             "native batch contains incompatible value shapes"
         );
         ensure!(
@@ -399,7 +570,8 @@ mod center_split_tests {
         };
         let mut rng = ChaCha12Rng::seed_from_u64(7);
         for _ in 0..100 {
-            let plan = make_center_split_plan(12, config, &mut rng).unwrap();
+            let plan =
+                make_center_split_plan(12, config, ReverseConfig::disabled(), &mut rng).unwrap();
             assert!((-2..=2).contains(&plan.shift));
             assert!(plan.start <= 4);
             assert!(plan.start + config.center_length as usize <= 12);
@@ -422,6 +594,8 @@ mod center_split_tests {
             test_values(),
             config,
             false,
+            ReverseConfig::disabled(),
+            None,
             &mut rng,
         )
         .unwrap();
@@ -430,8 +604,9 @@ mod center_split_tests {
         assert_eq!(values.shape(), &[4, 1, 2]);
         assert_eq!(metadata.len(), 4);
         let mut seen = HashSet::new();
-        for (row, (name, shift, chunk_index)) in metadata.iter().enumerate() {
+        for (row, (name, shift, chunk_index, reverse)) in metadata.iter().enumerate() {
             assert_eq!(*shift, 0);
+            assert!(!reverse);
             assert!(seen.insert(*chunk_index));
             let chunk_start = 2 + chunk_index * 2;
             assert_eq!(sequence[[row, 0]], chunk_start as u8);
@@ -463,12 +638,15 @@ mod center_split_tests {
             values,
             config,
             false,
+            ReverseConfig::disabled(),
+            None,
             &mut rng,
         )
         .unwrap();
         assert_eq!(sequence.shape(), &[2, 4]);
         assert_eq!(values.shape(), &[2, 1, 2]);
-        for (row, (_, _, chunk_index)) in metadata.iter().enumerate() {
+        for (row, (_, _, chunk_index, reverse)) in metadata.iter().enumerate() {
+            assert!(!reverse);
             let value_start = 1 + chunk_index * 2;
             assert_eq!(values[[row, 0, 0]].to_f32(), value_start as f32);
         }
@@ -493,6 +671,8 @@ mod center_split_tests {
             values,
             config,
             false,
+            ReverseConfig::disabled(),
+            &IndexMap::new(),
             &mut rng,
         )
         .unwrap();
@@ -500,6 +680,78 @@ mod center_split_tests {
         assert_eq!(sequence.shape(), &[2, 4]);
         assert_eq!(metadata.len(), 2);
         assert_eq!(metadata[0].1, metadata[1].1);
+    }
+
+    #[test]
+    fn segment_reverse_complements_dna_and_permutates_channels_in_one_plan() {
+        let config = CenterSplitConfig {
+            center_length: 4,
+            shift_width: 0,
+            num_segments: 1,
+            resolution: 1,
+        };
+        // A, C, G, N -> reverse-complement is N, C?  The source order after
+        // reversal is N, G, C, A; complementing gives N, C, G, T.
+        let sequence = Array2::from_shape_vec((1, 4), vec![0, 1, 2, 4]).unwrap();
+        let values = Array3::from_shape_fn((1, 4, 4), |(_, channel, position)| {
+            bf16::from_f32((channel * 10 + position) as f32)
+        });
+        let reverse_indices = vec![0, 2, 1, 3];
+        let mut rng = ChaCha12Rng::seed_from_u64(17);
+        let (sequence, values, metadata) = center_split_record(
+            test_region(),
+            100,
+            sequence,
+            values,
+            config,
+            false,
+            ReverseConfig::parse(1.0, "segment").unwrap(),
+            Some(&reverse_indices),
+            &mut rng,
+        )
+        .unwrap();
+
+        assert_eq!(
+            sequence,
+            Array2::from_shape_vec((1, 4), vec![4, 1, 2, 3]).unwrap()
+        );
+        assert_eq!(metadata[0].3, true);
+        assert_eq!(values[[0, 0, 0]].to_f32(), 3.0);
+        assert_eq!(values[[0, 0, 3]].to_f32(), 0.0);
+        // Output channel 1 reads source channel 2; output channel 2 reads
+        // source channel 1.
+        assert_eq!(values[[0, 1, 0]].to_f32(), 23.0);
+        assert_eq!(values[[0, 2, 0]].to_f32(), 13.0);
+        assert_eq!(values[[0, 3, 0]].to_f32(), 33.0);
+    }
+
+    #[test]
+    fn segment_granularity_can_make_independent_decisions() {
+        let config = CenterSplitConfig {
+            center_length: 8,
+            shift_width: 0,
+            num_segments: 4,
+            resolution: 1,
+        };
+        let mut rng = ChaCha12Rng::seed_from_u64(23);
+        let plan = make_center_split_plan(
+            8,
+            config,
+            ReverseConfig::parse(1.0, "segment").unwrap(),
+            &mut rng,
+        )
+        .unwrap();
+        assert_eq!(plan.reverse, vec![true; 4]);
+
+        let mut rng = ChaCha12Rng::seed_from_u64(23);
+        let plan = make_center_split_plan(
+            8,
+            config,
+            ReverseConfig::parse(0.0, "parent").unwrap(),
+            &mut rng,
+        )
+        .unwrap();
+        assert_eq!(plan.reverse, vec![false; 4]);
     }
 }
 
@@ -698,10 +950,16 @@ impl GenomeDataLoader {
         &self,
         regions: Vec<GenomicRange>,
         channels_last: bool,
+        include_sequence: bool,
     ) -> ParallelLoader<DataStoreBf16ParentRegionIter, RegionBFloat16Record> {
         self.data_store
             .clone()
-            .par_iter_bf16_parent_with_layout_and_regions(regions, self.n_jobs, channels_last)
+            .par_iter_bf16_parent_with_layout_and_regions(
+                regions,
+                self.n_jobs,
+                channels_last,
+                include_sequence,
+            )
     }
 
     fn center_split_config(
@@ -789,30 +1047,35 @@ impl GenomeDataLoader {
     /// the available shift flank.
     ///
     /// Each yielded item contains arrays for all output segments from one
-    /// parent and a list of `(segment_name, applied_shift, chunk_index)`
-    /// metadata tuples.  The low-level iterator reads one parent at a time so
-    /// one shared shift/order plan is unambiguous.  It does this even when
-    /// the loader was constructed with a larger ordinary `batch_size`; that
-    /// setting only affects the legacy iterator.
-    pub fn iter_bfloat16_dlpack_center_split(
+    /// parent and a list of `(segment_name, applied_shift, chunk_index,
+    /// reverse)` metadata tuples.  By default the reverse decision is sampled
+    /// independently for each output segment.
+    fn iter_bfloat16_dlpack_center_split(
         &self,
         channels_last: bool,
         center_length: Option<u32>,
         shift_width: u32,
         num_segments: Option<usize>,
+        reverse_config: ReverseConfig,
+        reverse_indices: Option<Vec<usize>>,
     ) -> Result<GenomeDataLoaderAugmentedBFloat16DLPackIter> {
         let config = self.center_split_config(center_length, shift_width, num_segments)?;
+        if let Some(indices) = reverse_indices.as_deref() {
+            validate_reverse_indices(indices, self.tracks().len(), "loader")?;
+        }
         let seed = self.random_seed ^ 0x6a09e667f3bcc909;
-        let raw = self.raw_region_bfloat16_iterator(self.ordered_regions(), channels_last);
+        let raw = self.raw_region_bfloat16_iterator(self.ordered_regions(), channels_last, true);
         let mut rng = ChaCha12Rng::seed_from_u64(seed);
         let augmented = raw.map(move |(region, physical_start, sequence, values)| {
             center_split_record(
                 region,
                 physical_start,
-                sequence,
+                sequence.expect("the single-loader native iterator must include DNA"),
                 values,
                 config,
                 channels_last,
+                reverse_config,
+                reverse_indices.as_deref(),
                 &mut rng,
             )
             .expect("invalid center/split augmentation record")
@@ -1239,16 +1502,36 @@ else:
 
     /// Python-facing native center/crop/split iterator.
     #[pyo3(name = "iter_bfloat16_dlpack_center_split")]
-    #[pyo3(signature = (channels_last=false, mid=None, shift=0, segments_length=None))]
+    #[pyo3(signature = (
+        channels_last=false,
+        mid=None,
+        shift=0,
+        segments_length=None,
+        reverse_probability=0.5,
+        reverse_granularity="segment",
+        reverse_indices=None,
+    ))]
     fn iter_bfloat16_dlpack_center_split_py(
         slf: PyRef<'_, Self>,
         channels_last: bool,
         mid: Option<u32>,
         shift: u32,
         segments_length: Option<usize>,
+        reverse_probability: f64,
+        reverse_granularity: &str,
+        reverse_indices: Option<Vec<usize>>,
     ) -> PyResult<GenomeDataLoaderAugmentedBFloat16DLPackIter> {
-        slf.iter_bfloat16_dlpack_center_split(channels_last, mid, shift, segments_length)
-            .map_err(Into::into)
+        let reverse_config =
+            ReverseConfig::parse(reverse_probability, reverse_granularity).map_err(PyErr::from)?;
+        slf.iter_bfloat16_dlpack_center_split(
+            channels_last,
+            mid,
+            shift,
+            segments_length,
+            reverse_config,
+            reverse_indices,
+        )
+        .map_err(Into::into)
     }
 
     fn __repr__(&self) -> String {
@@ -1355,10 +1638,7 @@ impl GenomeDataLoaderAugmentedBFloat16DLPackIter {
             return Ok(None);
         }
 
-        let actual_segments: usize = records
-            .iter()
-            .map(|record| record.0.shape()[0])
-            .sum();
+        let actual_segments: usize = records.iter().map(|record| record.0.shape()[0]).sum();
         if actual_segments < batch_size && drop_last {
             return Ok(None);
         }
@@ -1592,13 +1872,15 @@ impl Iterator for MultiRegionBFloat16Iterator {
             } else {
                 physical_start = Some(current_physical_start);
             }
-            if let Some(expected) = sequence.as_ref() {
-                assert_eq!(
-                    expected, &current_sequence,
-                    "all genome data loaders must yield the same DNA sequence"
-                );
-            } else {
-                sequence = Some(current_sequence);
+            if let Some(current_sequence) = current_sequence {
+                if let Some(expected) = sequence.as_ref() {
+                    assert_eq!(
+                        expected, &current_sequence,
+                        "genome data loaders yielded different DNA sequences"
+                    );
+                } else {
+                    sequence = Some(current_sequence);
+                }
             }
             values.insert(tag.clone(), current_values);
         }
@@ -1635,7 +1917,11 @@ fn combine_multi_augmented_bfloat16_records(
         values.insert(
             tag.clone(),
             Array3::<bf16>::from_elem(
-                (total_segments, first_values.shape()[1], first_values.shape()[2]),
+                (
+                    total_segments,
+                    first_values.shape()[1],
+                    first_values.shape()[2],
+                ),
                 bf16::from_f32(0.0),
             ),
         );
@@ -1689,6 +1975,8 @@ fn center_split_multi_record(
     values: IndexMap<String, Array3<bf16>>,
     config: CenterSplitConfig,
     channels_last: bool,
+    reverse_config: ReverseConfig,
+    reverse_indices: &IndexMap<String, Vec<usize>>,
     rng: &mut ChaCha12Rng,
 ) -> Result<MultiAugmentedBFloat16Record> {
     ensure!(
@@ -1697,7 +1985,7 @@ fn center_split_multi_record(
     );
     let parent_length = sequence.shape()[1];
     let parent_value_length = parent_length / config.resolution as usize;
-    let plan = make_center_split_plan(parent_length, config, rng)?;
+    let plan = make_center_split_plan(parent_length, config, reverse_config, rng)?;
     let output_sequence = split_sequence_with_plan(&sequence, config, &plan);
     let metadata = segment_metadata(&region, physical_start, &plan);
     let mut output_values = IndexMap::new();
@@ -1719,9 +2007,20 @@ fn center_split_multi_record(
             );
             current_values.shape()[1]
         };
+        if let Some(indices) = reverse_indices.get(&tag) {
+            validate_reverse_indices(indices, n_tracks, &tag)?;
+        }
+        let mapped_indices = reverse_indices.get(&tag).map(Vec::as_slice);
         output_values.insert(
             tag,
-            split_values_with_plan(&current_values, config, channels_last, &plan, n_tracks),
+            split_values_with_plan(
+                &current_values,
+                config,
+                channels_last,
+                &plan,
+                n_tracks,
+                mapped_indices,
+            ),
         );
     }
     Ok((output_sequence, output_values, metadata))
@@ -1776,12 +2075,14 @@ impl GenomeDataLoaderMap {
 
     /// Iterate over synchronized heads after one shared center crop, shift,
     /// and equal split plan has been applied to each parent.
-    pub fn iter_bfloat16_dlpack_center_split(
+    fn iter_bfloat16_dlpack_center_split(
         &self,
         channels_last: bool,
         center_length: Option<u32>,
         shift_width: u32,
         num_segments: Option<usize>,
+        reverse_config: ReverseConfig,
+        reverse_indices: IndexMap<String, Vec<usize>>,
     ) -> Result<MultiAugmentedBFloat16DLPackIter> {
         let first = self
             .0
@@ -1800,14 +2101,27 @@ impl GenomeDataLoaderMap {
             );
         }
 
+        for (tag, indices) in &reverse_indices {
+            let loader = self
+                .0
+                .get(tag)
+                .ok_or_else(|| anyhow::anyhow!("reverse_indices contains unknown head '{tag}'"))?;
+            validate_reverse_indices(indices, loader.tracks().len(), tag)?;
+        }
+
         let regions = first.ordered_regions();
         let raw_iters = self
             .0
             .iter()
-            .map(|(tag, loader)| {
+            .enumerate()
+            .map(|(loader_index, (tag, loader))| {
                 (
                     tag.clone(),
-                    loader.raw_region_bfloat16_iterator(regions.clone(), channels_last),
+                    loader.raw_region_bfloat16_iterator(
+                        regions.clone(),
+                        channels_last,
+                        loader_index == 0,
+                    ),
                 )
             })
             .collect();
@@ -1821,6 +2135,8 @@ impl GenomeDataLoaderMap {
                 values,
                 config,
                 channels_last,
+                reverse_config,
+                &reverse_indices,
                 &mut rng,
             )
             .expect("invalid synchronized center/split augmentation record")
@@ -2031,16 +2347,36 @@ impl GenomeDataLoaderMap {
 
     /// Python-facing synchronized center/crop/split iterator.
     #[pyo3(name = "iter_bfloat16_dlpack_center_split")]
-    #[pyo3(signature = (channels_last=false, mid=None, shift=0, segments_length=None))]
+    #[pyo3(signature = (
+        channels_last=false,
+        mid=None,
+        shift=0,
+        segments_length=None,
+        reverse_probability=0.5,
+        reverse_granularity="segment",
+        reverse_indices=None,
+    ))]
     fn iter_bfloat16_dlpack_center_split_py(
         slf: PyRef<'_, Self>,
         channels_last: bool,
         mid: Option<u32>,
         shift: u32,
         segments_length: Option<usize>,
+        reverse_probability: f64,
+        reverse_granularity: &str,
+        reverse_indices: Option<IndexMap<String, Vec<usize>>>,
     ) -> PyResult<MultiAugmentedBFloat16DLPackIter> {
-        slf.iter_bfloat16_dlpack_center_split(channels_last, mid, shift, segments_length)
-            .map_err(PyErr::from)
+        let reverse_config =
+            ReverseConfig::parse(reverse_probability, reverse_granularity).map_err(PyErr::from)?;
+        slf.iter_bfloat16_dlpack_center_split(
+            channels_last,
+            mid,
+            shift,
+            segments_length,
+            reverse_config,
+            reverse_indices.unwrap_or_default(),
+        )
+        .map_err(PyErr::from)
     }
 
     fn __repr__(&self) -> String {
@@ -2204,10 +2540,7 @@ impl MultiAugmentedBFloat16DLPackIter {
             return Ok(None);
         }
 
-        let actual_segments: usize = records
-            .iter()
-            .map(|record| record.0.shape()[0])
-            .sum();
+        let actual_segments: usize = records.iter().map(|record| record.0.shape()[0]).sum();
         if actual_segments < batch_size && drop_last {
             return Ok(None);
         }

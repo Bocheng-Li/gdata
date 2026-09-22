@@ -12,6 +12,7 @@ use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha12Rng;
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+use serde::de::{Deserializer, Visitor};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
@@ -61,6 +62,44 @@ static PROFILE_FINAL_SEQ_LAYOUT_NS: AtomicU64 = AtomicU64::new(0);
 static PROFILE_FINAL_SEQ_LAYOUT_COUNT: AtomicU64 = AtomicU64::new(0);
 static PROFILE_FINAL_VALUES_LAYOUT_NS: AtomicU64 = AtomicU64::new(0);
 static PROFILE_FINAL_VALUES_LAYOUT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Deserialize the byte sequence field without allocating a second copy.
+///
+/// The gdata record is serialized as `(Vec<u8>, Array2<bf16>)`.  bincode's
+/// `IgnoredAny` deliberately is not supported by its serde adapter, so use a
+/// small visitor that asks for a borrowed byte slice and discards it.
+struct SkipByteSequence;
+
+impl<'de> Deserialize<'de> for SkipByteSequence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct SkipVisitor;
+
+        impl<'de> Visitor<'de> for SkipVisitor {
+            type Value = SkipByteSequence;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a serialized byte sequence")
+            }
+
+            fn visit_borrowed_bytes<E>(self, _value: &'de [u8]) -> Result<Self::Value, E> {
+                Ok(SkipByteSequence)
+            }
+
+            fn visit_bytes<E>(self, _value: &[u8]) -> Result<Self::Value, E> {
+                Ok(SkipByteSequence)
+            }
+
+            fn visit_byte_buf<E>(self, _value: Vec<u8>) -> Result<Self::Value, E> {
+                Ok(SkipByteSequence)
+            }
+        }
+
+        deserializer.deserialize_bytes(SkipVisitor)
+    }
+}
 
 fn profile_start() -> Option<Instant> {
     PROFILE_ENABLED.load(Ordering::Relaxed).then(Instant::now)
@@ -712,6 +751,58 @@ impl DataStore {
         Some((Sequence(sequence), values))
     }
 
+    /// Read only the values from a complete physical parent record.
+    ///
+    /// Every modality gdata file currently stores a copy of the DNA sequence
+    /// alongside its track values.  A synchronized multi-modality iterator
+    /// only needs to materialize that sequence once, from the first loader;
+    /// the remaining loaders use this method.  The sequence bytes are still
+    /// present in, and therefore still have to be decompressed from, the
+    /// compressed record.  `SkipByteSequence` lets bincode advance over that
+    /// field without retaining a second DNA vector.
+    pub fn read_parent_values_bf16_with_layout(
+        &mut self,
+        region: &GenomicRange,
+        channels_last: bool,
+    ) -> Option<Array3<bf16>> {
+        let offset = self.inner.metadata.segment_index.get(region)?;
+        let mut buffer = vec![0; offset.0 .1 as usize];
+        let file_read_start = profile_start();
+        self.inner
+            .file
+            .read_exact_at(&mut buffer, offset.0 .0 as u64)
+            .expect("read failed");
+        profile_record(
+            &PROFILE_FILE_READ_NS,
+            &PROFILE_FILE_READ_COUNT,
+            file_read_start,
+        );
+
+        let zstd_start = profile_start();
+        let buffer = decompress_data_zst(&buffer);
+        profile_record(&PROFILE_ZSTD_NS, &PROFILE_ZSTD_COUNT, zstd_start);
+
+        let bincode_start = profile_start();
+        let (_, arr): (SkipByteSequence, Array2<bf16>) =
+            bincode::serde::decode_from_slice(&buffer, bincode::config::standard())
+                .expect("decode failed")
+                .0;
+        profile_record(&PROFILE_BINCODE_NS, &PROFILE_BINCODE_COUNT, bincode_start);
+
+        let (n_tracks, n_values) = arr.dim();
+        let values = if channels_last {
+            arr.view()
+                .t()
+                .insert_axis(Axis(0))
+                .as_standard_layout()
+                .to_owned()
+        } else {
+            arr.into_shape_with_order((1, n_tracks, n_values))
+                .expect("decoded values must be contiguous")
+        };
+        Some(values)
+    }
+
     /// Backwards-compatible bfloat16 wrapper used by the existing Rust API.
     pub fn read(&mut self, region: &GenomicRange) -> Option<(Sequence, Values)> {
         let (seq, values) = self.read_bf16(region)?;
@@ -862,8 +953,11 @@ impl DataStore {
         regions: Vec<GenomicRange>,
         num_threads: usize,
         channels_last: bool,
-    ) -> ParallelLoader<DataStoreBf16ParentRegionIter, (GenomicRange, u64, Array2<u8>, Array3<bf16>)>
-    {
+        include_sequence: bool,
+    ) -> ParallelLoader<
+        DataStoreBf16ParentRegionIter,
+        (GenomicRange, u64, Option<Array2<u8>>, Array3<bf16>),
+    > {
         let num_threads = num_threads.max(1);
         let iters = split_n_with_batch_size(&regions, num_threads, 1)
             .into_iter()
@@ -871,6 +965,7 @@ impl DataStore {
                 segments: chunk.into(),
                 store: self.clone(),
                 channels_last,
+                include_sequence,
             })
             .collect::<Vec<_>>();
         ParallelLoader::new(iters)
@@ -974,22 +1069,31 @@ pub struct DataStoreBf16ParentRegionIter {
     segments: VecDeque<GenomicRange>,
     store: DataStore,
     channels_last: bool,
+    include_sequence: bool,
 }
 
 impl Iterator for DataStoreBf16ParentRegionIter {
-    type Item = (GenomicRange, u64, Array2<u8>, Array3<bf16>);
+    type Item = (GenomicRange, u64, Option<Array2<u8>>, Array3<bf16>);
 
     fn next(&mut self) -> Option<Self::Item> {
         let segment = self.segments.pop_front()?;
-        let (seq, values) = self
-            .store
-            .read_parent_bf16_with_layout(&segment, self.channels_last)?;
+        let (sequence, values) = if self.include_sequence {
+            let (seq, values) = self
+                .store
+                .read_parent_bf16_with_layout(&segment, self.channels_last)?;
+            (Some(seq.into()), values)
+        } else {
+            let values = self
+                .store
+                .read_parent_values_bf16_with_layout(&segment, self.channels_last)?;
+            (None, values)
+        };
         // The metadata range denotes the logical (unpadded) interval.  The
         // first base of the physical parent therefore starts at this origin.
         // `saturating_sub` handles chromosome-start records whose left flank
         // is represented by N bases outside the chromosome.
         let physical_start = segment.start().saturating_sub(self.store.n_pad() as u64);
-        Some((segment, physical_start, seq.into(), values))
+        Some((segment, physical_start, sequence, values))
     }
 }
 
