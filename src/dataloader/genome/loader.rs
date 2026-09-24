@@ -1824,6 +1824,10 @@ impl DataIndexer {
         If True, sequences will be returned as strings instead of numpy integer arrays.
         This is useful for cases where you want to work with the sequences as text,
         such as for visualization or text-based analysis.
+    n_jobs : Optional[int]
+        Total number of parallel workers shared by all heads. Workers are
+        assigned in proportion to each head's track count, with at least one
+        worker per head. If omitted, each loader keeps its own ``n_jobs``.
 
     See Also
     --------
@@ -2100,6 +2104,65 @@ impl std::fmt::Display for GenomeDataLoaderMap {
 }
 
 impl GenomeDataLoaderMap {
+    /// Split a total worker budget across heads in proportion to track count.
+    /// Each head needs at least one producer so synchronized iteration can
+    /// make progress. Largest-remainder rounding keeps the assigned sum exact.
+    fn allocate_jobs(
+        loaders: &mut IndexMap<String, GenomeDataLoader>,
+        total_jobs: usize,
+    ) -> Result<()> {
+        let head_count = loaders.len();
+        ensure!(total_jobs > 0, "n_jobs must be positive");
+        ensure!(
+            total_jobs >= head_count,
+            "n_jobs ({total_jobs}) must be at least the number of heads ({head_count})"
+        );
+
+        let weights: Vec<usize> = loaders
+            .values()
+            .map(|loader| loader.tracks().len().max(1))
+            .collect();
+        let total_weight: usize = weights.iter().sum();
+        let mut allocations = Vec::with_capacity(head_count);
+        let mut remainders = Vec::with_capacity(head_count);
+        let mut allocated = 0usize;
+        for weight in &weights {
+            let numerator = total_jobs
+                .checked_mul(*weight)
+                .ok_or_else(|| anyhow::anyhow!("n_jobs allocation overflows"))?;
+            let base = numerator / total_weight;
+            allocations.push(base);
+            remainders.push(numerator % total_weight);
+            allocated += base;
+        }
+
+        // Assign leftover workers to the heads with the largest fractional
+        // shares, preserving insertion order for exact ties.
+        let mut order: Vec<usize> = (0..head_count).collect();
+        order.sort_by_key(|&index| (std::cmp::Reverse(remainders[index]), index));
+        for &index in order.iter().take(total_jobs - allocated) {
+            allocations[index] += 1;
+        }
+
+        // Very uneven weights can round a small head to zero. Give every
+        // head one worker by moving workers from the largest allocations.
+        for index in 0..head_count {
+            if allocations[index] == 0 {
+                let donor = (0..head_count)
+                    .filter(|&candidate| allocations[candidate] > 1)
+                    .max_by_key(|&candidate| allocations[candidate])
+                    .expect("total_jobs >= number of heads guarantees a donor");
+                allocations[donor] -= 1;
+                allocations[index] = 1;
+            }
+        }
+
+        for ((_, loader), jobs) in loaders.iter_mut().zip(allocations) {
+            loader.n_jobs = jobs;
+        }
+        Ok(())
+    }
+
     pub fn len(&self) -> usize {
         self.0[0].num_batch()
     }
@@ -2217,10 +2280,16 @@ impl GenomeDataLoaderMap {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(2);
+        let total_jobs = self
+            .0
+            .values()
+            .map(|loader| loader.n_jobs)
+            .sum::<usize>()
+            .max(1);
         Ok(MultiAugmentedBFloat16DLPackIter {
             iter: PrefethIterator::new(
                 augmented,
-                first.n_jobs.max(1).saturating_mul(prefetch_multiplier),
+                total_jobs.saturating_mul(prefetch_multiplier),
             ),
             seq_as_string: first.seq_as_string,
             num_segments: config.num_segments,
@@ -2234,8 +2303,9 @@ impl GenomeDataLoaderMap {
     #[pyo3(
         signature = (
             loaders, *, batch_size=None, target_length=None, window_size=None, seq_as_string=false,
+            n_jobs=None,
         ),
-        text_signature = "($self, loaders, *, batch_size=None, target_length=None, window_size=None, seq_as_string=False)"
+        text_signature = "($self, loaders, *, batch_size=None, target_length=None, window_size=None, seq_as_string=False, n_jobs=None)"
     )]
     pub fn new(
         mut loaders: IndexMap<String, GenomeDataLoader>,
@@ -2243,6 +2313,7 @@ impl GenomeDataLoaderMap {
         target_length: Option<u32>,
         window_size: Option<u32>,
         seq_as_string: bool,
+        n_jobs: Option<usize>,
     ) -> Result<Self> {
         ensure!(
             !loaders.is_empty(),
@@ -2272,6 +2343,13 @@ impl GenomeDataLoaderMap {
             });
         });
 
+        // Without an explicit total, keep the historical per-loader worker
+        // settings. With n_jobs set, reinterpret it as the total budget for
+        // all heads and assign shares according to their track counts.
+        if let Some(total_jobs) = n_jobs {
+            Self::allocate_jobs(&mut loaders, total_jobs)?;
+        }
+
         ensure!(
             loaders
                 .values()
@@ -2299,6 +2377,12 @@ impl GenomeDataLoaderMap {
                 (k.clone(), n_tracks)
             })
             .collect()
+    }
+
+    /// Total number of native workers assigned across all heads.
+    #[getter]
+    fn n_jobs(&self) -> usize {
+        self.0.values().map(|loader| loader.n_jobs).sum()
     }
 
     /** Returns the segments of the genome as a vector of strings.

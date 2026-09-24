@@ -50,6 +50,10 @@ use crate::w5z::W5Z;
         A list of chromosomes to include in the dataset. If None, all chromosomes in the FASTA file will be used.
     temp_dir
         Optional temporary directory for intermediate files. If None, a system temporary directory will be used.
+    chunk_tracks
+        Optional positive number of tracks per independently compressed gdata
+        block. If None, use the legacy single-frame segment format. The DNA
+        sequence remains embedded in every block; it is not stored separately.
 
     See Also
     --------
@@ -93,6 +97,7 @@ impl GenomeDataBuilder {
         resolution: u32,
         padding: u32,
         temp_dir: Option<PathBuf>,
+        chunk_tracks: Option<usize>,
     ) -> Result<Self> {
         let tmp_dir = if let Some(dir) = temp_dir {
             tempfile::Builder::new()
@@ -101,7 +106,7 @@ impl GenomeDataBuilder {
         } else {
             tempfile::Builder::new().prefix("gdata_tmp").tempdir()?
         };
-        let store_builder = DataStoreBuilder::new(&tmp_dir, window_size, resolution, padding)?;
+        let store_builder = DataStoreBuilder::new_with_chunk_tracks(&tmp_dir, window_size, resolution, padding, chunk_tracks)?;
         Ok(Self {
             location,
             store_builder: Some((store_builder, tmp_dir)),
@@ -115,10 +120,10 @@ impl GenomeDataBuilder {
     #[pyo3(
         signature = (
             location, genome_fasta, window_size, *, segments=None, step_size=None, resolution=32,
-            padding=0, chroms=None, temp_dir=None,
+            padding=0, chroms=None, temp_dir=None, chunk_tracks=None,
         ),
         text_signature = "($self, location, genome_fasta, window_size, *, segments=None,
-            step_size=None, resolution=32, padding=0, chroms=None, temp_dir=None)"
+            step_size=None, resolution=32, padding=0, chroms=None, temp_dir=None, chunk_tracks=None)"
     )]
     pub fn new(
         location: PathBuf,
@@ -130,6 +135,7 @@ impl GenomeDataBuilder {
         padding: u32,
         chroms: Option<Vec<String>>,
         temp_dir: Option<PathBuf>,
+        chunk_tracks: Option<usize>,
     ) -> Result<Self> {
         let tmp_dir = if let Some(dir) = temp_dir {
             tempfile::Builder::new()
@@ -138,7 +144,7 @@ impl GenomeDataBuilder {
         } else {
             tempfile::Builder::new().prefix("gdata_tmp").tempdir()?
         };
-        let mut store_builder = DataStoreBuilder::new(&tmp_dir, window_size, resolution, padding)?;
+        let mut store_builder = DataStoreBuilder::new_with_chunk_tracks(&tmp_dir, window_size, resolution, padding, chunk_tracks)?;
         let mut fasta_reader = open_fasta(genome_fasta)?;
 
         // Retrieve chromosome sizes from the FASTA index
@@ -188,8 +194,8 @@ impl GenomeDataBuilder {
     /// once per record, then call ``finish``.
     #[staticmethod]
     #[pyo3(
-        signature = (location, window_size, *, resolution=1, padding=0, temp_dir=None),
-        text_signature = "(location, window_size, *, resolution=1, padding=0, temp_dir=None)"
+        signature = (location, window_size, *, resolution=1, padding=0, temp_dir=None, chunk_tracks=None),
+        text_signature = "(location, window_size, *, resolution=1, padding=0, temp_dir=None, chunk_tracks=None)"
     )]
     pub fn streaming(
         location: PathBuf,
@@ -197,8 +203,9 @@ impl GenomeDataBuilder {
         resolution: u32,
         padding: u32,
         temp_dir: Option<PathBuf>,
+        chunk_tracks: Option<usize>,
     ) -> Result<Self> {
-        Self::create_streaming(location, window_size, resolution, padding, temp_dir)
+        Self::create_streaming(location, window_size, resolution, padding, temp_dir, chunk_tracks)
     }
 
     /** Returns the keys (track names) in the dataset.

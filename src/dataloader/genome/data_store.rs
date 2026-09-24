@@ -11,7 +11,10 @@ use noodles::fasta::io::IndexedReader;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha12Rng;
-use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+use rayon::iter::{
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
+};
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use serde::de::{Deserializer, Visitor};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -288,8 +291,101 @@ impl Into<Array2<u8>> for Sequence {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Offset((u64, u64));
 
-#[derive(Debug, Decode, Encode)]
+#[derive(Debug)]
 pub struct StoreMetadata {
+    segment_index: IndexMap<GenomicRange, Offset>,
+    data_keys: IndexSet<String>,
+    sequence_length: u32,
+    resolution: u32,
+    padding: u32,
+    pub(crate) chunk_index: Option<IndexMap<GenomicRange, Vec<Offset>>>,
+    pub(crate) chunk_tracks: Option<usize>,
+}
+
+#[derive(Debug, Decode, Encode)]
+struct ChunkStoreMetadata {
+    #[bincode(with_serde)]
+    segment_index: IndexMap<GenomicRange, Vec<Offset>>,
+    #[bincode(with_serde)]
+    data_keys: IndexSet<String>,
+    sequence_length: u32,
+    resolution: u32,
+    padding: u32,
+    chunk_tracks: usize,
+}
+
+const CHUNK_METADATA_MAGIC: &[u8] = b"GDATA_CHUNK_V1\0";
+
+impl StoreMetadata {
+    pub fn encode(self) -> Result<Vec<u8>> {
+        let data = if let Some(chunk_index) = self.chunk_index {
+            let mut payload = CHUNK_METADATA_MAGIC.to_vec();
+            payload.extend(bincode::encode_to_vec(
+                ChunkStoreMetadata {
+                    segment_index: chunk_index,
+                    data_keys: self.data_keys,
+                    sequence_length: self.sequence_length,
+                    resolution: self.resolution,
+                    padding: self.padding,
+                    chunk_tracks: self.chunk_tracks.unwrap_or(1),
+                },
+                bincode::config::standard(),
+            )?);
+            payload
+        } else {
+            // Keep legacy metadata byte-for-byte compatible with old files.
+            bincode::encode_to_vec(
+                LegacyStoreMetadata {
+                    segment_index: self.segment_index,
+                    data_keys: self.data_keys,
+                    sequence_length: self.sequence_length,
+                    resolution: self.resolution,
+                    padding: self.padding,
+                },
+                bincode::config::standard(),
+            )?
+        };
+        let data = compress_data_zst(data, 9);
+        Ok(data)
+    }
+
+    pub fn decode(buffer: &[u8]) -> Result<Self> {
+        let mut data = decompress_data_zst(buffer);
+        if data.starts_with(CHUNK_METADATA_MAGIC) {
+            let payload = &mut data[CHUNK_METADATA_MAGIC.len()..];
+            let metadata: ChunkStoreMetadata =
+                bincode::decode_from_slice(payload, bincode::config::standard())?.0;
+            ensure!(
+                metadata.chunk_tracks > 0,
+                "chunked gdata metadata has an invalid chunk_tracks value"
+            );
+            Ok(Self {
+                segment_index: IndexMap::new(),
+                data_keys: metadata.data_keys,
+                sequence_length: metadata.sequence_length,
+                resolution: metadata.resolution,
+                padding: metadata.padding,
+                chunk_index: Some(metadata.segment_index),
+                chunk_tracks: Some(metadata.chunk_tracks),
+            })
+        } else {
+            let metadata: LegacyStoreMetadata =
+                bincode::decode_from_slice(&mut data, bincode::config::standard())?.0;
+            Ok(Self {
+                segment_index: metadata.segment_index,
+                data_keys: metadata.data_keys,
+                sequence_length: metadata.sequence_length,
+                resolution: metadata.resolution,
+                padding: metadata.padding,
+                chunk_index: None,
+                chunk_tracks: None,
+            })
+        }
+    }
+}
+
+#[derive(Debug, Decode, Encode)]
+struct LegacyStoreMetadata {
     #[bincode(with_serde)]
     segment_index: IndexMap<GenomicRange, Offset>,
     #[bincode(with_serde)]
@@ -297,19 +393,6 @@ pub struct StoreMetadata {
     sequence_length: u32,
     resolution: u32,
     padding: u32,
-}
-
-impl StoreMetadata {
-    pub fn encode(self) -> Result<Vec<u8>> {
-        let data = bincode::encode_to_vec(self, bincode::config::standard())?;
-        let data = compress_data_zst(data, 9);
-        Ok(data)
-    }
-
-    pub fn decode(buffer: &[u8]) -> Result<Self> {
-        let mut data = decompress_data_zst(buffer);
-        Ok(bincode::decode_from_slice(&mut data, bincode::config::standard())?.0)
-    }
 }
 
 /// Options for reading from the data store.
@@ -425,12 +508,157 @@ impl DataStore {
         })
     }
 
-    pub fn segments(&self) -> impl Iterator<Item = &GenomicRange> {
-        self.inner.metadata.segment_index.keys()
+    fn is_chunked(&self) -> bool {
+        self.inner.metadata.chunk_index.is_some()
+    }
+
+    fn chunk_pool(&self, num_threads: usize) -> Option<Arc<ThreadPool>> {
+        self.is_chunked().then(|| {
+            Arc::new(
+                ThreadPoolBuilder::new()
+                    .num_threads(num_threads.max(1))
+                    .thread_name(|index| format!("gdata-chunk-{index}"))
+                    .build()
+                    .expect("failed to create gdata chunk worker pool"),
+            )
+        })
+    }
+
+    fn offsets_for_region(&self, region: &GenomicRange) -> Option<Vec<Offset>> {
+        if let Some(index) = &self.inner.metadata.chunk_index {
+            index.get(region).cloned()
+        } else {
+            self.inner
+                .metadata
+                .segment_index
+                .get(region)
+                .cloned()
+                .map(|offset| vec![offset])
+        }
+    }
+
+    fn read_frame(&self, offset: &Offset) -> Result<Vec<u8>> {
+        let mut buffer = vec![0; offset.0 .1 as usize];
+        let file_read_start = profile_start();
+        self.inner
+            .file
+            .read_exact_at(&mut buffer, offset.0 .0)
+            .context("failed to read gdata frame")?;
+        profile_record(
+            &PROFILE_FILE_READ_NS,
+            &PROFILE_FILE_READ_COUNT,
+            file_read_start,
+        );
+        Ok(buffer)
+    }
+
+    fn decode_frame(
+        &self,
+        offset: &Offset,
+        include_sequence: bool,
+    ) -> Result<(Option<Vec<u8>>, Array2<bf16>)> {
+        let compressed = self.read_frame(offset)?;
+        let zstd_start = profile_start();
+        let buffer = decompress_data_zst(&compressed);
+        profile_record(&PROFILE_ZSTD_NS, &PROFILE_ZSTD_COUNT, zstd_start);
+        let bincode_start = profile_start();
+        let decoded = if include_sequence {
+            let (sequence, values): (Vec<u8>, Array2<bf16>) =
+                bincode::serde::decode_from_slice(&buffer, bincode::config::standard())?.0;
+            (Some(sequence), values)
+        } else {
+            let (_, values): (SkipByteSequence, Array2<bf16>) =
+                bincode::serde::decode_from_slice(&buffer, bincode::config::standard())?.0;
+            (None, values)
+        };
+        profile_record(&PROFILE_BINCODE_NS, &PROFILE_BINCODE_COUNT, bincode_start);
+        Ok(decoded)
+    }
+
+    /// Decode one complete record.  Chunked records are independently
+    /// compressed per track block; the blocks are decoded in one shared pool
+    /// so the caller's worker budget is not multiplied by nested pools.
+    fn read_decoded_record(
+        &self,
+        region: &GenomicRange,
+        include_sequence: bool,
+        pool: Option<&ThreadPool>,
+    ) -> Result<(Option<Vec<u8>>, Array2<bf16>)> {
+        let offsets = self
+            .offsets_for_region(region)
+            .ok_or_else(|| anyhow::anyhow!("unknown gdata segment {}", region.pretty_show()))?;
+        ensure!(!offsets.is_empty(), "gdata segment has no compressed chunks");
+
+        if !self.is_chunked() {
+            return self.decode_frame(&offsets[0], include_sequence);
+        }
+
+        let decode = || {
+            offsets
+                .par_iter()
+                .enumerate()
+                // The sequence is intentionally repeated in every chunk so
+                // chunks remain self-contained. Materialize it only from the
+                // first block; `SkipByteSequence` still advances over the
+                // field in all remaining blocks without allocating another
+                // parent-sized DNA vector.
+                .map(|(index, offset)| self.decode_frame(offset, include_sequence && index == 0))
+                .collect::<Result<Vec<_>>>()
+        };
+        let parts = if let Some(pool) = pool {
+            pool.install(decode)?
+        } else {
+            decode()?
+        };
+
+        let mut sequence = None;
+        let mut n_values = None;
+        let mut n_tracks = 0usize;
+        let mut data = Vec::new();
+        for (part_sequence, values) in parts {
+            if let Some(current) = part_sequence {
+                if let Some(expected) = sequence.as_ref() {
+                    ensure!(
+                        expected == &current,
+                        "sequence differs between track chunks for {}",
+                        region.pretty_show()
+                    );
+                } else {
+                    sequence = Some(current);
+                }
+            }
+            let (tracks, values_length) = values.dim();
+            if let Some(expected) = n_values {
+                ensure!(
+                    expected == values_length,
+                    "track chunks for {} have incompatible lengths",
+                    region.pretty_show()
+                );
+            } else {
+                n_values = Some(values_length);
+            }
+            n_tracks += tracks;
+            data.extend(values.iter().copied());
+        }
+        let values = Array2::from_shape_vec((n_tracks, n_values.unwrap_or(0)), data)
+            .context("failed to assemble gdata track chunks")?;
+        Ok((sequence, values))
+    }
+
+    pub fn segments(&self) -> Box<dyn Iterator<Item = &GenomicRange> + '_> {
+        if let Some(index) = &self.inner.metadata.chunk_index {
+            Box::new(index.keys())
+        } else {
+            Box::new(self.inner.metadata.segment_index.keys())
+        }
     }
 
     pub fn num_segments(&self) -> usize {
-        self.inner.metadata.segment_index.len()
+        self.inner
+            .metadata
+            .chunk_index
+            .as_ref()
+            .map_or_else(|| self.inner.metadata.segment_index.len(), IndexMap::len)
     }
 
     pub fn data_keys(&self) -> &IndexSet<String> {
@@ -514,29 +742,20 @@ impl DataStore {
         region: &GenomicRange,
         channels_last: bool,
     ) -> Option<(Sequence, Array3<bf16>)> {
-        let offset = self.inner.metadata.segment_index.get(region)?;
-        let mut buffer = vec![0; offset.0 .1 as usize];
-        let file_read_start = profile_start();
-        self.inner
-            .file
-            .read_exact_at(&mut buffer, offset.0 .0 as u64)
-            .expect("read failed");
-        profile_record(
-            &PROFILE_FILE_READ_NS,
-            &PROFILE_FILE_READ_COUNT,
-            file_read_start,
-        );
+        self.read_bf16_with_layout_threads(region, channels_last, None)
+    }
 
-        // Deserialize the sequence and values
-        let zstd_start = profile_start();
-        let buffer = decompress_data_zst(&buffer);
-        profile_record(&PROFILE_ZSTD_NS, &PROFILE_ZSTD_COUNT, zstd_start);
-        let bincode_start = profile_start();
-        let (seq, arr): (Vec<u8>, Array2<bf16>) =
-            bincode::serde::decode_from_slice(&buffer, bincode::config::standard())
-                .expect("decode failed")
-                .0;
-        profile_record(&PROFILE_BINCODE_NS, &PROFILE_BINCODE_COUNT, bincode_start);
+    pub(crate) fn read_bf16_with_layout_threads(
+        &mut self,
+        region: &GenomicRange,
+        channels_last: bool,
+        pool: Option<&ThreadPool>,
+    ) -> Option<(Sequence, Array3<bf16>)> {
+        self.offsets_for_region(region)?;
+        let (seq, arr) = self
+            .read_decoded_record(region, true, pool)
+            .expect("failed to decode gdata segment");
+        let seq = seq.expect("gdata record did not contain a sequence");
 
         let postprocess_start = profile_start();
         let seq_shape_start = profile_start();
@@ -713,29 +932,20 @@ impl DataStore {
         region: &GenomicRange,
         channels_last: bool,
     ) -> Option<(Sequence, Array3<bf16>)> {
-        let offset = self.inner.metadata.segment_index.get(region)?;
-        let mut buffer = vec![0; offset.0 .1 as usize];
-        let file_read_start = profile_start();
-        self.inner
-            .file
-            .read_exact_at(&mut buffer, offset.0 .0 as u64)
-            .expect("read failed");
-        profile_record(
-            &PROFILE_FILE_READ_NS,
-            &PROFILE_FILE_READ_COUNT,
-            file_read_start,
-        );
+        self.read_parent_bf16_with_layout_threads(region, channels_last, None)
+    }
 
-        let zstd_start = profile_start();
-        let buffer = decompress_data_zst(&buffer);
-        profile_record(&PROFILE_ZSTD_NS, &PROFILE_ZSTD_COUNT, zstd_start);
-
-        let bincode_start = profile_start();
-        let (seq, arr): (Vec<u8>, Array2<bf16>) =
-            bincode::serde::decode_from_slice(&buffer, bincode::config::standard())
-                .expect("decode failed")
-                .0;
-        profile_record(&PROFILE_BINCODE_NS, &PROFILE_BINCODE_COUNT, bincode_start);
+    pub(crate) fn read_parent_bf16_with_layout_threads(
+        &mut self,
+        region: &GenomicRange,
+        channels_last: bool,
+        pool: Option<&ThreadPool>,
+    ) -> Option<(Sequence, Array3<bf16>)> {
+        self.offsets_for_region(region)?;
+        let (seq, arr) = self
+            .read_decoded_record(region, true, pool)
+            .expect("failed to decode gdata parent");
+        let seq = seq.expect("gdata parent did not contain a sequence");
 
         let sequence = Array2::from_shape_vec((1, seq.len()), seq)
             .expect("decoded sequence must be one-dimensional");
@@ -767,29 +977,19 @@ impl DataStore {
         region: &GenomicRange,
         channels_last: bool,
     ) -> Option<Array3<bf16>> {
-        let offset = self.inner.metadata.segment_index.get(region)?;
-        let mut buffer = vec![0; offset.0 .1 as usize];
-        let file_read_start = profile_start();
-        self.inner
-            .file
-            .read_exact_at(&mut buffer, offset.0 .0 as u64)
-            .expect("read failed");
-        profile_record(
-            &PROFILE_FILE_READ_NS,
-            &PROFILE_FILE_READ_COUNT,
-            file_read_start,
-        );
+        self.read_parent_values_bf16_with_layout_threads(region, channels_last, None)
+    }
 
-        let zstd_start = profile_start();
-        let buffer = decompress_data_zst(&buffer);
-        profile_record(&PROFILE_ZSTD_NS, &PROFILE_ZSTD_COUNT, zstd_start);
-
-        let bincode_start = profile_start();
-        let (_, arr): (SkipByteSequence, Array2<bf16>) =
-            bincode::serde::decode_from_slice(&buffer, bincode::config::standard())
-                .expect("decode failed")
-                .0;
-        profile_record(&PROFILE_BINCODE_NS, &PROFILE_BINCODE_COUNT, bincode_start);
+    pub(crate) fn read_parent_values_bf16_with_layout_threads(
+        &mut self,
+        region: &GenomicRange,
+        channels_last: bool,
+        pool: Option<&ThreadPool>,
+    ) -> Option<Array3<bf16>> {
+        self.offsets_for_region(region)?;
+        let (_, arr) = self
+            .read_decoded_record(region, false, pool)
+            .expect("failed to decode gdata parent values");
 
         let (n_tracks, n_values) = arr.dim();
         let values = if channels_last {
@@ -821,7 +1021,11 @@ impl DataStore {
     }
 
     pub fn read_at(&mut self, i: usize) -> Option<(Sequence, Values)> {
-        let region = self.inner.metadata.segment_index.get_index(i)?.0.clone();
+        let region = if let Some(index) = &self.inner.metadata.chunk_index {
+            index.get_index(i)?.0.clone()
+        } else {
+            self.inner.metadata.segment_index.get_index(i)?.0.clone()
+        };
         self.read(&region)
     }
 
@@ -832,30 +1036,29 @@ impl DataStore {
         shuffle: bool,
         subset: Option<&[GenomicRange]>,
     ) -> impl Iterator<Item = (Array2<u8>, Array3<f32>)> {
+        let chunked = self.is_chunked();
+        let chunk_pool = self.chunk_pool(num_threads);
         let mut segments = if let Some(s) = subset {
             assert!(
                 s.iter()
-                    .all(|r| self.inner.metadata.segment_index.contains_key(r)),
+                    .all(|r| self.offsets_for_region(r).is_some()),
                 "Some segments in the subset do not exist in the data store"
             );
             s.to_vec()
         } else {
-            self.inner
-                .metadata
-                .segment_index
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
+            self.segments().cloned().collect::<Vec<_>>()
         };
         if shuffle {
             segments.shuffle(&mut self.read_opts.rng);
         }
-        let iters = split_n_with_batch_size(&segments, num_threads, batch_size)
+        let iterator_threads = if chunked { 1 } else { num_threads.max(1) };
+        let iters = split_n_with_batch_size(&segments, iterator_threads, batch_size)
             .into_iter()
             .map(|chunk| {
                 let iter = DataStoreIter {
                     segments: chunk.into(),
                     store: self.clone(),
+                    chunk_pool: chunk_pool.clone(),
                 };
                 ReBatch::new(iter, batch_size)
             })
@@ -888,31 +1091,30 @@ impl DataStore {
         subset: Option<&[GenomicRange]>,
         channels_last: bool,
     ) -> impl Iterator<Item = (Array2<u8>, Array3<bf16>)> {
+        let chunked = self.is_chunked();
+        let chunk_pool = self.chunk_pool(num_threads);
         let mut segments = if let Some(s) = subset {
             assert!(
                 s.iter()
-                    .all(|r| self.inner.metadata.segment_index.contains_key(r)),
+                    .all(|r| self.offsets_for_region(r).is_some()),
                 "Some segments in the subset do not exist in the data store"
             );
             s.to_vec()
         } else {
-            self.inner
-                .metadata
-                .segment_index
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
+            self.segments().cloned().collect::<Vec<_>>()
         };
         if shuffle {
             segments.shuffle(&mut self.read_opts.rng);
         }
-        let iters = split_n_with_batch_size(&segments, num_threads, batch_size)
+        let iterator_threads = if chunked { 1 } else { num_threads.max(1) };
+        let iters = split_n_with_batch_size(&segments, iterator_threads, batch_size)
             .into_iter()
             .map(|chunk| {
                 let iter = DataStoreBf16Iter {
                     segments: chunk.into(),
                     store: self.clone(),
                     channels_last,
+                    chunk_pool: chunk_pool.clone(),
                 };
                 ReBatch::new(iter, batch_size)
             })
@@ -933,13 +1135,16 @@ impl DataStore {
         num_threads: usize,
         channels_last: bool,
     ) -> ParallelLoader<DataStoreBf16RegionIter, (GenomicRange, Array2<u8>, Array3<bf16>)> {
-        let num_threads = num_threads.max(1);
-        let iters = split_n_with_batch_size(&regions, num_threads, 1)
+        let chunked = self.is_chunked();
+        let chunk_pool = self.chunk_pool(num_threads);
+        let iterator_threads = if chunked { 1 } else { num_threads.max(1) };
+        let iters = split_n_with_batch_size(&regions, iterator_threads, 1)
             .into_iter()
             .map(|chunk| DataStoreBf16RegionIter {
                 segments: chunk.into(),
                 store: self.clone(),
                 channels_last,
+                chunk_pool: chunk_pool.clone(),
             })
             .collect::<Vec<_>>();
         ParallelLoader::new(iters)
@@ -959,26 +1164,33 @@ impl DataStore {
         channels_last: bool,
         include_sequence: bool,
     ) -> StreamingParallelLoader<(GenomicRange, u64, Option<Array2<u8>>, Array3<bf16>)> {
-        let num_threads = num_threads.max(1);
-        let iters = split_n_with_batch_size(&regions, num_threads, 1)
+        let chunked = self.is_chunked();
+        let chunk_pool = self.chunk_pool(num_threads);
+        // Chunked records use the shared inner pool for block reads.  Keep a
+        // single parent producer per head so the outer stream cannot multiply
+        // the block pool into nested segment workers.
+        let iterator_threads = if chunked { 1 } else { num_threads.max(1) };
+        let iters = split_n_with_batch_size(&regions, iterator_threads, 1)
             .into_iter()
             .map(|chunk| DataStoreBf16ParentRegionIter {
                 segments: chunk.into(),
                 store: self.clone(),
                 channels_last,
                 include_sequence,
+                chunk_pool: chunk_pool.clone(),
             })
             .collect::<Vec<_>>();
         // Keep roughly one completed parent per worker in flight, but do not
         // wait for all workers to finish before exposing the first completed
         // parent.  The old ParallelLoader introduced a refill barrier here.
-        StreamingParallelLoader::new(iters, num_threads)
+        StreamingParallelLoader::new(iters, iterator_threads)
     }
 }
 
 pub struct DataStoreIter {
     segments: VecDeque<GenomicRange>,
     store: DataStore,
+    chunk_pool: Option<Arc<ThreadPool>>,
 }
 
 impl Iterator for DataStoreIter {
@@ -986,7 +1198,14 @@ impl Iterator for DataStoreIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         let segment = self.segments.pop_front()?;
-        let (seq, values) = self.store.read_bf16(&segment).unwrap();
+        let (seq, values) = self
+            .store
+            .read_bf16_with_layout_threads(
+                &segment,
+                true,
+                self.chunk_pool.as_deref(),
+            )
+            .unwrap();
         let value_convert_start = profile_start();
         let values: Array3<f32> = values.mapv(|x| x.to_f32());
         profile_record(
@@ -1008,6 +1227,7 @@ pub struct DataStoreBf16Iter {
     segments: VecDeque<GenomicRange>,
     store: DataStore,
     channels_last: bool,
+    chunk_pool: Option<Arc<ThreadPool>>,
 }
 
 impl Iterator for DataStoreBf16Iter {
@@ -1017,7 +1237,11 @@ impl Iterator for DataStoreBf16Iter {
         let segment = self.segments.pop_front()?;
         let (seq, values) = self
             .store
-            .read_bf16_with_layout(&segment, self.channels_last)
+            .read_bf16_with_layout_threads(
+                &segment,
+                self.channels_last,
+                self.chunk_pool.as_deref(),
+            )
             .unwrap();
         Some((seq.into(), values))
     }
@@ -1044,6 +1268,7 @@ pub struct DataStoreBf16RegionIter {
     segments: VecDeque<GenomicRange>,
     store: DataStore,
     channels_last: bool,
+    chunk_pool: Option<Arc<ThreadPool>>,
 }
 
 impl Iterator for DataStoreBf16RegionIter {
@@ -1053,7 +1278,11 @@ impl Iterator for DataStoreBf16RegionIter {
         let segment = self.segments.pop_front()?;
         let (seq, values) = self
             .store
-            .read_bf16_with_layout(&segment, self.channels_last)?;
+            .read_bf16_with_layout_threads(
+                &segment,
+                self.channels_last,
+                self.chunk_pool.as_deref(),
+            )?;
         Some((segment, seq.into(), values))
     }
 }
@@ -1074,6 +1303,7 @@ pub struct DataStoreBf16ParentRegionIter {
     store: DataStore,
     channels_last: bool,
     include_sequence: bool,
+    chunk_pool: Option<Arc<ThreadPool>>,
 }
 
 impl Iterator for DataStoreBf16ParentRegionIter {
@@ -1084,12 +1314,20 @@ impl Iterator for DataStoreBf16ParentRegionIter {
         let (sequence, values) = if self.include_sequence {
             let (seq, values) = self
                 .store
-                .read_parent_bf16_with_layout(&segment, self.channels_last)?;
+                .read_parent_bf16_with_layout_threads(
+                    &segment,
+                    self.channels_last,
+                    self.chunk_pool.as_deref(),
+                )?;
             (Some(seq.into()), values)
         } else {
             let values = self
                 .store
-                .read_parent_values_bf16_with_layout(&segment, self.channels_last)?;
+                .read_parent_values_bf16_with_layout_threads(
+                    &segment,
+                    self.channels_last,
+                    self.chunk_pool.as_deref(),
+                )?;
             (None, values)
         };
         // The metadata range denotes the logical (unpadded) interval.  The
@@ -1125,6 +1363,7 @@ pub struct DataStoreBuilder {
     // This lets Python callers stream batches while finish() verifies that
     // every segment has a value block for every track.
     value_counts: HashMap<String, usize>,
+    pub(crate) chunk_tracks: Option<usize>,
 }
 
 impl DataStoreBuilder {
@@ -1135,6 +1374,16 @@ impl DataStoreBuilder {
         resolution: u32,
         padding: u32,
     ) -> Result<Self> {
+        Self::new_with_chunk_tracks(location, sequence_length, resolution, padding, None)
+    }
+
+    pub fn new_with_chunk_tracks(
+        location: impl AsRef<Path>,
+        sequence_length: u32,
+        resolution: u32,
+        padding: u32,
+        chunk_tracks: Option<usize>,
+    ) -> Result<Self> {
         ensure!(
             sequence_length % resolution == 0,
             "window size must be a multiple of resolution"
@@ -1143,6 +1392,9 @@ impl DataStoreBuilder {
             padding % resolution == 0,
             "Padding must be a multiple of resolution"
         );
+        if let Some(n) = chunk_tracks {
+            ensure!(n > 0, "chunk_tracks must be positive");
+        }
 
         if !location.as_ref().exists() {
             std::fs::create_dir_all(&location)?;
@@ -1153,6 +1405,7 @@ impl DataStoreBuilder {
             segments: IndexMap::new(),
             data_keys: IndexSet::new(),
             value_counts: HashMap::new(),
+            chunk_tracks,
             sequence_length,
             resolution,
             padding,
@@ -1630,6 +1883,41 @@ impl DataStoreBuilder {
             .with_style(style);
 
         let n_keys = self.data_keys.len();
+        if let Some(chunk_tracks) = self.chunk_tracks {
+            let mut chunk_index = IndexMap::new();
+            let mut offset = 0u64;
+            for (range, file_path) in &self.segments {
+                let (blocks, sizes) = compress_data_file_chunks(file_path, n_keys, chunk_tracks)?;
+                let offsets = sizes
+                    .iter()
+                    .map(|size| {
+                        let out = Offset((offset, *size as u64));
+                        offset += *size as u64;
+                        out
+                    })
+                    .collect::<Vec<_>>();
+                for block in blocks {
+                    store.write_all(&block)?;
+                }
+                chunk_index.insert(range.clone(), offsets);
+            }
+            bar.finish();
+            let metadata = StoreMetadata {
+                segment_index: IndexMap::new(),
+                data_keys: self.data_keys.clone(),
+                sequence_length: self.sequence_length,
+                resolution: self.resolution,
+                padding: self.padding,
+                chunk_index: Some(chunk_index),
+                chunk_tracks: Some(chunk_tracks),
+            };
+            let metadata_bytes = metadata.encode()?;
+            store.write_all(&metadata_bytes)?;
+            let metadata_len = metadata_bytes.len() as u32;
+            store.write_all(&offset.to_le_bytes())?;
+            store.write_all(&metadata_len.to_le_bytes())?;
+            return Ok(());
+        }
         let sizes: Vec<_> = self
             .segments
             .values_mut()
@@ -1669,6 +1957,8 @@ impl DataStoreBuilder {
             sequence_length: self.sequence_length,
             resolution: self.resolution,
             padding: self.padding,
+            chunk_index: None,
+            chunk_tracks: None,
         };
         let metadata_byes = metadata.encode()?;
         store.write_all(&metadata_byes)?;
@@ -1763,6 +2053,50 @@ fn compress_data_file(file_path: impl AsRef<Path>, nrow: usize) -> Result<(Vec<u
     let bytes = compress_data_zst(bytes, 9);
     let n_bytes = bytes.len();
     Ok((bytes, n_bytes))
+}
+
+fn compress_data_file_chunks(
+    file_path: impl AsRef<Path>,
+    nrow: usize,
+    chunk_tracks: usize,
+) -> Result<(Vec<Vec<u8>>, Vec<usize>)> {
+    let mut file = File::open(&file_path).with_context(|| {
+        format!("Failed to open data file at: {}", file_path.as_ref().display())
+    })?;
+    let mut n = [0; 8];
+    file.read_exact(&mut n)?;
+    let n = u64::from_le_bytes(n) as usize;
+    let mut buf = vec![0; n];
+    file.read_exact(&mut buf)?;
+    let seq = decompress_data_zst(&buf);
+    let mut rows = Vec::with_capacity(nrow);
+    for _ in 0..nrow {
+        let mut n = [0; 8];
+        file.read_exact(&mut n)?;
+        let n = u64::from_le_bytes(n) as usize;
+        let mut buf = vec![0; n];
+        file.read_exact(&mut buf)?;
+        let values = decompress_data_zst(&buf);
+        let values: Vec<bf16> = bincode::serde::decode_from_slice(
+            &values,
+            bincode::config::standard(),
+        )?
+        .0;
+        rows.push(values);
+    }
+    let mut blocks = Vec::new();
+    let mut sizes = Vec::new();
+    for chunk in rows.chunks(chunk_tracks) {
+        let ncols = chunk.first().map(|r| r.len()).unwrap_or(0);
+        let data = chunk.iter().flat_map(|r| r.iter().copied()).collect::<Vec<_>>();
+        let arr = Array2::from_shape_vec((chunk.len(), ncols), data)
+            .map_err(|e| anyhow::anyhow!("Failed to create chunk array: {}", e))?;
+        let encoded = bincode::serde::encode_to_vec((seq.clone(), arr), bincode::config::standard())?;
+        let encoded = compress_data_zst(encoded, 9);
+        sizes.push(encoded.len());
+        blocks.push(encoded);
+    }
+    Ok((blocks, sizes))
 }
 
 fn get_seq(
@@ -2090,6 +2424,68 @@ mod tests {
         )
     }
 
+    fn create_deterministic_store(location: impl AsRef<Path>, chunk_tracks: Option<usize>) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let tmp = temp_dir.as_ref().join("store_builder");
+        let sequence_length = 8;
+        let padding = 2;
+        let resolution = 2;
+        let mut store = DataStoreBuilder::new_with_chunk_tracks(
+            &tmp,
+            sequence_length,
+            resolution,
+            padding,
+            chunk_tracks,
+        )
+        .unwrap();
+        let regions = (0..2)
+            .map(|index| {
+                GenomicRange::from_str(&format!(
+                    "chr1:{}-{}",
+                    index * sequence_length as usize + 1,
+                    (index + 1) * sequence_length as usize
+                ))
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let sequences = regions
+            .iter()
+            .enumerate()
+            .map(|(segment, region)| {
+                (
+                    region.clone(),
+                    (0..(sequence_length + 2 * padding))
+                        .map(|position| (segment * 20 + position as usize) as u8)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        store.add_seqs(sequences.into_par_iter()).unwrap();
+
+        for track in 0..5 {
+            let values = regions
+                .iter()
+                .enumerate()
+                .map(|(segment, region)| {
+                    (
+                        region.clone(),
+                        (0..((sequence_length + 2 * padding) / resolution))
+                            .map(|position| {
+                                bf16::from_f32(
+                                    (track * 100 + segment * 10 + position as usize) as f32,
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            store
+                .add_values(format!("track_{track}"), values.into_par_iter())
+                .unwrap();
+        }
+        store.finish(location).unwrap();
+    }
+
     #[test]
     fn test_arr_aggregation() {
         let arr = array![
@@ -2168,6 +2564,54 @@ mod tests {
             values,
             array.slice(s![.., 8 / 2..(1024 + 8) / 2, ..]).to_owned()
         );
+    }
+
+    #[test]
+    fn test_chunked_store_matches_legacy_store() {
+        for (index, chunk_tracks) in [None, Some(1), Some(2), Some(10)].into_iter().enumerate() {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let location = temp_dir.path().join(format!("store_{index}.gdata"));
+            create_deterministic_store(&location, chunk_tracks);
+            let mut store = DataStore::open(&location, DataStoreReadOptions::default()).unwrap();
+
+            assert_eq!(store.num_segments(), 2);
+            assert_eq!(store.segments().count(), 2);
+            if let Some(chunk_tracks) = chunk_tracks {
+                let chunks = store.inner.metadata.chunk_index.as_ref().unwrap();
+                assert_eq!(store.inner.metadata.chunk_tracks, Some(chunk_tracks));
+                assert_eq!(chunks.values().next().unwrap().len(), 5usize.div_ceil(chunk_tracks));
+            } else {
+                assert!(store.inner.metadata.chunk_index.is_none());
+            }
+
+            let region = store.segments().nth(1).unwrap().clone();
+            let (sequence, values) = store.read(&region).unwrap();
+            assert_eq!(sequence.0.into_raw_vec_and_offset().0, (20u8..32).collect::<Vec<_>>()[2..10]);
+            assert_eq!(values.0.shape(), [1, 4, 5]);
+            for track in 0..5 {
+                for position in 0..4 {
+                    let expected = bf16::from_f32((track * 100 + 10 + position + 1) as f32).to_f32();
+                    assert_eq!(values.0[[0, position, track]].to_f32(), expected);
+                }
+            }
+
+            let (parent_sequence, parent_values) = store
+                .read_parent_bf16_with_layout(&region, false)
+                .unwrap();
+            assert_eq!(parent_sequence.0.shape(), [1, 12]);
+            assert_eq!(parent_values.shape(), [1, 5, 6]);
+            let parent_values_only = store
+                .read_parent_values_bf16_with_layout(&region, true)
+                .unwrap();
+            assert_eq!(parent_values_only.shape(), [1, 6, 5]);
+
+            let mut iter_store = DataStore::open(&location, DataStoreReadOptions::default()).unwrap();
+            let records = iter_store
+                .par_iter_bf16_with_layout(1, 3, false, None, false)
+                .collect::<Vec<_>>();
+            assert_eq!(records.len(), 2);
+            assert!(records.iter().all(|(_, values)| values.shape() == [1, 5, 4]));
+        }
     }
 
     #[test]

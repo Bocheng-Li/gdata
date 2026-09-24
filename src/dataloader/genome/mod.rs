@@ -136,6 +136,7 @@ mod tests {
             8,
             None,
             None,
+            None,
         )
         .unwrap();
         builder.add_file("data1", w5z1).unwrap();

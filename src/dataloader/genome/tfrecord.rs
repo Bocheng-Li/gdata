@@ -623,6 +623,7 @@ fn convert_paths(
     max_records: Option<usize>,
     num_threads: Option<usize>,
     overwrite: bool,
+    chunk_tracks: Option<usize>,
 ) -> Result<usize> {
     ensure!(!paths.is_empty(), "at least one TFRecord path is required");
     ensure!(
@@ -808,11 +809,12 @@ fn convert_paths(
                 if let Some((record, _permit)) = pending.remove(&(next_file, next_record)) {
                     let name = format!("{}:{}-{}", record.chromosome, record.start, record.end);
                     if builder.is_none() {
-                        builder = Some(DataStoreBuilder::new(
+                        builder = Some(DataStoreBuilder::new_with_chunk_tracks(
                             &tmp,
                             record.target_length as u32,
                             1,
                             0,
+                            chunk_tracks,
                         )?);
                     }
                     let segment = GenomicRange::from_str(&name)
@@ -893,7 +895,7 @@ fn convert_paths(
 /// `RAYON_NUM_THREADS`) controls the worker count.  It avoids TensorFlow,
 /// FASTA, intermediate W5Z files, and Python tensor copies.
 #[pyfunction]
-#[pyo3(signature = (paths, output, modality, split, *, temp_dir=None, max_records=None, num_threads=None, overwrite=false))]
+#[pyo3(signature = (paths, output, modality, split, *, temp_dir=None, max_records=None, num_threads=None, overwrite=false, chunk_tracks=None))]
 pub fn convert_tfrecord_to_gdata(
     paths: Vec<PathBuf>,
     output: PathBuf,
@@ -903,6 +905,7 @@ pub fn convert_tfrecord_to_gdata(
     max_records: Option<usize>,
     num_threads: Option<usize>,
     overwrite: bool,
+    chunk_tracks: Option<usize>,
 ) -> Result<usize> {
     convert_paths(
         &paths,
@@ -913,5 +916,6 @@ pub fn convert_tfrecord_to_gdata(
         max_records,
         num_threads,
         overwrite,
+        chunk_tracks,
     )
 }

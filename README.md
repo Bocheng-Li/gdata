@@ -50,3 +50,42 @@ is forwarded immediately instead of waiting for the other workers in the same
 refill batch.  Consequently, parent records can arrive in completion order;
 for a `GenomeDataLoaderMap`, modalities are synchronized by their genomic
 range before the shared augmentation plan is applied.
+
+## Track-chunked gdata files
+
+The gdata writers accept an optional `chunk_tracks` argument. When it is a
+positive integer, each segment is stored as several independently compressed
+track blocks, with at most that many tracks per block. The DNA sequence stays
+inside each block (it is not moved to a separate sequence file), so the same
+parent/segment reader APIs continue to work. A reader decodes the blocks in
+parallel and reassembles the original track order; files created without this
+option keep the legacy single-frame format and remain readable.
+
+```python
+builder = gdata.GenomeDataBuilder(
+    "atac.gdata", "genome.fa", 1_048_576,
+    resolution=1, chunk_tracks=64,
+)
+builder.add_files(track_files)
+builder.finish()
+```
+
+The streaming builder and `convert_tfrecord_to_gdata(...,
+chunk_tracks=64)` use the same format. Choose a block size according to the
+number of tracks and available CPU parallelism; it does not change public
+array shapes.
+
+For synchronized multi-head loading, `GenomeDataLoaderMap` can receive one
+total worker budget. It assigns workers proportionally to the number of
+tracks in each head, with at least one worker per head:
+
+```python
+loader_map = gdata.GenomeDataLoaderMap(
+    {"atac": atac_loader, "rna_seq": rna_loader},
+    n_jobs=12,
+)
+```
+
+For 256 ATAC and 768 RNA tracks this gives 3 and 9 workers, respectively. If
+`n_jobs` is omitted, each loader's `GenomeDataLoader(n_jobs=...)` setting keeps
+its historical meaning.
