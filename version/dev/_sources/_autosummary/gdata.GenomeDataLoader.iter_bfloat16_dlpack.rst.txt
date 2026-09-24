@@ -1,0 +1,6 @@
+gdata.GenomeDataLoader.iter\_bfloat16\_dlpack
+=============================================
+
+.. currentmodule:: gdata
+
+.. automethod:: GenomeDataLoader.iter_bfloat16_dlpack

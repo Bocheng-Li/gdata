@@ -1,0 +1,6 @@
+gdata.GenomeDataLoaderMap.n\_jobs
+=================================
+
+.. currentmodule:: gdata
+
+.. autoattribute:: GenomeDataLoaderMap.n_jobs

@@ -1,0 +1,6 @@
+gdata.GenomeDataBuilder.streaming
+=================================
+
+.. currentmodule:: gdata
+
+.. automethod:: GenomeDataBuilder.streaming

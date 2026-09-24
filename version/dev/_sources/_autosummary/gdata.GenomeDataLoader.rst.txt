@@ -1,0 +1,41 @@
+﻿gdata.GenomeDataLoader
+======================
+
+.. currentmodule:: gdata
+
+.. autoclass:: GenomeDataLoader
+
+   
+   
+   .. rubric:: Attributes
+
+   .. autosummary::
+      :toctree: .
+   
+      ~GenomeDataLoader.batch_size
+      ~GenomeDataLoader.data
+      ~GenomeDataLoader.resolution
+      ~GenomeDataLoader.segments
+      ~GenomeDataLoader.shuffle
+      ~GenomeDataLoader.target_length
+      ~GenomeDataLoader.tracks
+      ~GenomeDataLoader.window_size
+   
+   
+
+   
+   
+   .. rubric:: Methods
+
+   .. autosummary::
+      :toctree: .
+   
+      ~GenomeDataLoader.copy
+      ~GenomeDataLoader.difference
+      ~GenomeDataLoader.hist
+      ~GenomeDataLoader.intersection
+      ~GenomeDataLoader.iter_bfloat16_dlpack
+      ~GenomeDataLoader.iter_bfloat16_dlpack_center_split
+      ~GenomeDataLoader.plot
+   
+   

@@ -1,0 +1,6 @@
+gdata.GenomeDataBuilder.add\_segment\_data
+==========================================
+
+.. currentmodule:: gdata
+
+.. automethod:: GenomeDataBuilder.add_segment_data

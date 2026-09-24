@@ -1,0 +1,6 @@
+gdata.GenomeDataLoader.iter\_bfloat16\_dlpack\_center\_split
+============================================================
+
+.. currentmodule:: gdata
+
+.. automethod:: GenomeDataLoader.iter_bfloat16_dlpack_center_split
